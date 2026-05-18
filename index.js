@@ -321,7 +321,7 @@ function alignSegmentsFromText(originalText, translatedText) {
     const segments = [];
     for (let i = 0; i < count; i++) {
         const source = originals[i]?.source ?? '';
-        const translation = translations[i] ?? source;
+        const translation = translations[i] ?? '';
         segments.push({
             id: originals[i]?.id ?? i + 1,
             source,
@@ -336,11 +336,11 @@ function normalizeVersionSegments(version, originalText) {
     if (Array.isArray(version?.segments) && version.segments.length) {
         return version.segments.map((segment, index) => {
             const source = String(segment.source ?? originalSegments[index]?.source ?? '').trim();
-            const translation = String(segment.translation ?? segment.text ?? source).trim();
+            const translation = String(segment.translation ?? segment.text ?? '').trim();
             return {
                 id: Number(segment.id) || originalSegments[index]?.id || index + 1,
                 source,
-                translation: translation || source,
+                translation,
             };
         });
     }
@@ -504,13 +504,14 @@ function buildMessages(sourceText, language, presetId, sourceSegments = getSourc
             '只翻译正文，不翻译思维链、推理过程、system/developer/tool 内容或任何解释文字。',
             '不要输出思考过程，不要添加注释，不要使用 Markdown 代码块。',
             '保持 segments 数组长度、顺序和 id 完全一致。',
-            '每个对象只填写对应 id 的 translation。',
+            '每个返回对象只允许包含 id 和 translation，不要返回 source_text、text、source 或原始字段。',
+            'translation 必须是 source_text 的译文，不是对 source_text 的复制。',
             `只有某段本来就已经是${targetLanguage}，或者它只是专名、代码、标记、章节编号等不应翻译内容时，才可以原样复制。`,
             forceTranslate ? `上一轮返回疑似照抄原文。请重新翻译，普通叙事和对话必须变成${targetLanguage}。` : '',
         ].filter(Boolean),
         segments: sourceSegments.map(segment => ({
             id: segment.id,
-            text: segment.source,
+            source_text: segment.source,
         })),
     };
     return [
@@ -526,7 +527,7 @@ function buildMessages(sourceText, language, presetId, sourceSegments = getSourc
             content: [
                 '下面是需要翻译的正文段落。请严格按 JSON 返回，禁止输出 JSON 以外的任何内容。',
                 '返回格式必须是：{"segments":[{"id":1,"translation":"..."}]}',
-                'translation 里可以包含换行，但不要新增、删除或合并段落 id。',
+                'translation 里可以包含换行，但不要新增、删除或合并段落 id；不要把 source_text 原样放进 translation。',
                 `目标语言再次确认：${targetLanguage}。`,
                 JSON.stringify(payload, null, 2),
             ].join('\n\n'),
@@ -585,7 +586,7 @@ function normalizeReturnedSegments(parsed, sourceSegments) {
     return sourceSegments.map((sourceSegment, index) => {
         const item = byId.get(sourceSegment.id) || list[index] || {};
         const rawTranslation = pickTranslationText(item, sourceSegment.source);
-        const translation = String(rawTranslation ?? '').trim() || sourceSegment.source;
+        const translation = String(rawTranslation ?? '').trim();
         return {
             id: sourceSegment.id,
             source: sourceSegment.source,
@@ -668,13 +669,15 @@ function parseTranslationResponse(rawText, sourceText, targetLanguage) {
     const parsed = parseJsonLoose(rawText);
     const jsonSegments = parsed ? normalizeReturnedSegments(parsed, sourceSegments) : null;
     const segments = jsonSegments?.length ? jsonSegments : alignSegmentsFromText(sourceText, rawText);
-    const text = segments.map(segment => segment.translation || segment.source).join('\n\n').trim();
+    const text = segments.map(segment => segment.translation || '').filter(Boolean).join('\n\n').trim();
+    const missingTranslationCount = segments.filter(segment => !String(segment.translation ?? '').trim()).length;
     return {
         text,
         segments,
         raw: String(rawText ?? '').trim(),
         usedFallback: !jsonSegments?.length,
         looksUntranslated: isProbablyUntranslated(segments, targetLanguage),
+        missingTranslationCount,
     };
 }
 
@@ -714,8 +717,9 @@ function yamlLine(key, value) {
 }
 
 function buildTavernBackendHeaders() {
-    const headers = { Authorization: '' };
+    const headers = {};
     const key = String(settings.apiKey || '').trim();
+    if (!key || settings.authMode === authModes.none) return '';
 
     if (key && settings.authMode === authModes.bearer) {
         headers.Authorization = `Bearer ${key}`;
@@ -727,14 +731,14 @@ function buildTavernBackendHeaders() {
     }
 
     return Object.entries(headers)
-        .filter(([name]) => name.trim())
+        .filter(([name, value]) => name.trim() && String(value ?? '').trim())
         .map(([name, value]) => yamlLine(name, value))
         .join('\n');
 }
 
 async function requestViaTavernBackend(endpoint, body) {
-    const baseEndpoint = normalizeBaseEndpoint(settings.endpoint);
-    if (!baseEndpoint) throw new Error('请先在扩展设置里填写 OpenAI 兼容 API 地址。');
+    const baseEndpoint = normalizeBaseEndpoint(endpoint || settings.endpoint);
+    if (!baseEndpoint) throw new Error('请先在扩展设置里填写副 API / 反代地址。');
 
     const payload = {
         stream: false,
@@ -789,7 +793,7 @@ async function requestDirectly(endpoint, body) {
 
 async function requestTranslationText(sourceText, options) {
     const endpoint = normalizeEndpoint(settings.endpoint);
-    if (!endpoint) throw new Error('请先在扩展设置里填写 OpenAI 兼容 API 地址。');
+    if (!endpoint) throw new Error('请先在扩展设置里填写副 API / 反代地址。');
     if (!settings.model) throw new Error('请先填写翻译模型名。');
     const sourceSegments = getSourceSegments(sourceText);
 
@@ -838,11 +842,14 @@ async function requestTranslationText(sourceText, options) {
     };
 
     let result = await sendAndParse(false);
-    if (result.looksUntranslated) {
+    if (result.looksUntranslated || result.missingTranslationCount) {
         result = await sendAndParse(true);
         result.retriedForCopy = true;
+        if (result.missingTranslationCount) {
+            throw new Error('API 返回内容里没有拿到有效 translation 字段，已拦截保存，避免把原文当译文显示。请点“刷新翻译”重试一次，或把提示词预设改回内置预设。');
+        }
         if (result.looksUntranslated) {
-            throw new Error('模型返回的译文仍然基本等于原文，已拦截保存。请确认目标语言是中文，并换一个更听指令的翻译模型或提示词预设。');
+            throw new Error('模型返回的译文仍然基本等于原文，已拦截保存。请确认目标语言是中文，并把提示词预设改回内置预设后刷新翻译。');
         }
     }
     return result;
@@ -953,8 +960,8 @@ function renderSettingsPanel() {
                 </div>
                 <div class="inline-drawer-content">
                     <div class="stft-grid">
-                        <label class="stft-span-2">OpenAI 兼容 API 地址
-                            <input id="stft_endpoint" class="text_pole" placeholder="http://127.0.0.1:8000/v1" value="${escapeHtml(settings.endpoint)}">
+                        <label class="stft-span-2">副 API / 反代地址
+                            <input id="stft_endpoint" class="text_pole" placeholder="https://example.com/v1" value="${escapeHtml(settings.endpoint)}">
                         </label>
                         <label>模型
                             <input id="stft_model" class="text_pole" placeholder="gpt-4o-mini" value="${escapeHtml(settings.model)}">
@@ -1043,7 +1050,10 @@ function bindSettingsPanel() {
     };
 
     $('#stft_endpoint').on('input', event => setAndSave('endpoint', event.target.value.trim()));
-    $('#stft_model').on('input', event => setAndSave('model', event.target.value.trim()));
+    $('#stft_model').on('input', event => {
+        setAndSave('model', event.target.value.trim());
+        refreshConditionalSettings();
+    });
     $('#stft_api_key').on('input', event => setAndSave('apiKey', event.target.value));
     $('#stft_auth_mode').on('change', event => {
         setAndSave('authMode', event.target.value);
