@@ -1,0 +1,11 @@
+{
+  "display_name": "楼层译文",
+  "loading_order": 25,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "Codex",
+  "version": "0.1.0",
+  "homePage": "https://github.com/SillyTavern/SillyTavern"
+}
