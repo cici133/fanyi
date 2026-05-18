@@ -200,6 +200,83 @@ function emptyStore() {
     return { version: 1, messages: {} };
 }
 
+function createDefaultRecord() {
+    return {
+        visible: false,
+        selectedId: null,
+        displayMode: settings.displayMode,
+        language: resolveTargetLanguage(),
+        presetId: settings.activePresetId,
+        status: 'idle',
+        statusText: '未开始',
+        versions: [],
+    };
+}
+
+function getMessageSourceText(messageId) {
+    return String(getMessageData(messageId)?.mes ?? '').trim();
+}
+
+function getMessageRecordKey(messageId) {
+    return `${String(messageId)}::reply:${hashText(getMessageSourceText(messageId))}`;
+}
+
+function getMessageIdFromRecordKey(recordKey) {
+    return String(recordKey).split('::')[0];
+}
+
+function getEventMessageId(payload) {
+    if (payload && typeof payload === 'object') {
+        return payload.messageId ?? payload.id ?? payload.mesId;
+    }
+    return payload;
+}
+
+function getReplyLabel(messageId) {
+    const message = getMessageData(messageId);
+    if (!message || !Array.isArray(message.swipes) || message.swipes.length <= 1) return '';
+    const swipeId = Number.isInteger(message.swipe_id) ? message.swipe_id : 0;
+    return `回复 ${swipeId + 1}/${message.swipes.length}`;
+}
+
+function getLiveReplyHashes(message) {
+    const values = new Set();
+    const sourceTexts = Array.isArray(message?.swipes) && message.swipes.length
+        ? message.swipes
+        : [message?.mes];
+    for (const sourceText of sourceTexts) {
+        const text = String(sourceText ?? '').trim();
+        if (text) values.add(hashText(text));
+    }
+    const currentText = String(message?.mes ?? '').trim();
+    if (currentText) values.add(hashText(currentText));
+    return values;
+}
+
+function pruneMissingRecords() {
+    const store = loadStore();
+    const chat = getContext().chat || [];
+    let changed = false;
+
+    for (const key of Object.keys(store.messages || {})) {
+        const messageId = getMessageIdFromRecordKey(key);
+        const message = chat[Number(messageId)];
+        if (!message) {
+            delete store.messages[key];
+            changed = true;
+            continue;
+        }
+
+        const match = String(key).match(/::reply:(.+)$/);
+        if (match && !getLiveReplyHashes(message).has(match[1])) {
+            delete store.messages[key];
+            changed = true;
+        }
+    }
+
+    if (changed) saveStore(store);
+}
+
 function loadStore() {
     try {
         const raw = localStorage.getItem(getStorageKey());
@@ -224,36 +301,26 @@ function saveStore(store) {
 
 function getMessageRecord(messageId) {
     const store = loadStore();
-    const key = String(messageId);
+    const key = getMessageRecordKey(messageId);
+    const legacyKey = String(messageId);
+    const message = getMessageData(messageId);
+    const canMigrateLegacy = !Array.isArray(message?.swipes) || message.swipes.length <= 1 || Number(message.swipe_id ?? 0) === 0;
+    if (!store.messages[key] && store.messages[legacyKey] && canMigrateLegacy) {
+        store.messages[key] = store.messages[legacyKey];
+        delete store.messages[legacyKey];
+        saveStore(store);
+    }
     if (!store.messages[key]) {
-        store.messages[key] = {
-            visible: false,
-            selectedId: null,
-            displayMode: settings.displayMode,
-            language: resolveTargetLanguage(),
-            presetId: settings.activePresetId,
-            status: 'idle',
-            statusText: '未开始',
-            versions: [],
-        };
+        store.messages[key] = createDefaultRecord();
         saveStore(store);
     }
     return { store, record: store.messages[key] };
 }
 
-function updateMessageRecord(messageId, updater) {
+function updateMessageRecord(messageId, updater, recordKey = getMessageRecordKey(messageId)) {
     const store = loadStore();
-    const key = String(messageId);
-    const record = store.messages[key] || {
-        visible: false,
-        selectedId: null,
-        displayMode: settings.displayMode,
-        language: resolveTargetLanguage(),
-        presetId: settings.activePresetId,
-        status: 'idle',
-        statusText: '未开始',
-        versions: [],
-    };
+    const key = String(recordKey);
+    const record = store.messages[key] || createDefaultRecord();
     updater(record);
     store.messages[key] = record;
     saveStore(store);
@@ -380,6 +447,14 @@ function applyDisplay(messageId) {
         updateButtonState($mes);
         return;
     }
+    if (version.sourceHash && version.sourceHash !== hashText(message.mes || '')) {
+        updateMessageRecord(messageId, nextRecord => {
+            nextRecord.visible = false;
+        });
+        restoreDisplay(messageId, false);
+        updateButtonState($mes);
+        return;
+    }
 
     const mode = record.displayMode || version.displayMode || settings.displayMode;
     const html = mode === displayModes.replace
@@ -414,10 +489,11 @@ function updateButtonState($mes) {
     if (!$mes?.length) return;
     const messageId = String($mes.attr('mesid'));
     const store = loadStore();
-    const record = store.messages[messageId];
+    const recordKey = getMessageRecordKey(messageId);
+    const record = store.messages[recordKey];
     const hasTranslation = Boolean(record?.versions?.length);
     const visible = Boolean(record?.visible && getSelectedVersion(record));
-    const loading = inFlight.has(messageId);
+    const loading = inFlight.has(recordKey);
     const title = loading
         ? '正在翻译...'
         : visible
@@ -434,6 +510,7 @@ function updateButtonState($mes) {
 function queueScan() {
     clearTimeout(scanTimer);
     scanTimer = setTimeout(() => {
+        pruneMissingRecords();
         ensureMessageButtons();
         reapplyVisibleDisplays();
     }, 80);
@@ -458,14 +535,19 @@ function ensureMessageButtons() {
 }
 
 function reapplyVisibleDisplays() {
-    const store = loadStore();
-    for (const [messageId, record] of Object.entries(store.messages || {})) {
-        if (record?.visible) {
+    $('#chat .mes').each((_, element) => {
+        const $mes = $(element);
+        const messageId = String($mes.attr('mesid'));
+        const record = loadStore().messages[getMessageRecordKey(messageId)];
+        if (record?.visible && getSelectedVersion(record)) {
             applyDisplay(messageId);
         } else {
-            updateButtonState(getMessageElement(messageId));
+            if ($mes.find('.mes_text .stft-render').length) {
+                restoreDisplay(messageId, false);
+            }
+            updateButtonState($mes);
         }
-    }
+    });
 }
 
 function resolveTargetLanguage(localValue = null, customValue = null) {
@@ -855,15 +937,15 @@ async function requestTranslationText(sourceText, options) {
     return result;
 }
 
-async function requestTranslation(messageId, options) {
-    const message = getMessageData(messageId);
-    const sourceText = String(message?.mes ?? '').trim();
+async function requestTranslation(messageId, options, sourceText = getMessageSourceText(messageId)) {
     if (!sourceText) throw new Error('这个楼层没有可翻译正文。');
     return requestTranslationText(sourceText, options);
 }
 
 async function translateMessage(messageId, options = {}) {
-    if (inFlight.has(String(messageId))) return;
+    const recordKey = getMessageRecordKey(messageId);
+    const sourceText = getMessageSourceText(messageId);
+    if (inFlight.has(recordKey)) return;
 
     const localOptions = {
         language: options.language || resolveTargetLanguage(),
@@ -872,19 +954,19 @@ async function translateMessage(messageId, options = {}) {
         autoShow: options.autoShow ?? settings.autoShow,
     };
 
-    inFlight.set(String(messageId), true);
+    inFlight.set(recordKey, true);
     updateMessageRecord(messageId, record => {
         record.status = 'loading';
         record.statusText = '正在请求翻译 API，等待模型返回...';
         record.language = localOptions.language;
         record.presetId = localOptions.presetId;
         record.displayMode = localOptions.displayMode;
-    });
+    }, recordKey);
     updateButtonState(getMessageElement(messageId));
     refreshModalIfOpen(messageId);
 
     try {
-        const result = await requestTranslation(messageId, localOptions);
+        const result = await requestTranslation(messageId, localOptions, sourceText);
         const prompt = getPromptById(localOptions.presetId);
         const version = {
             id: makeId('ver'),
@@ -896,7 +978,7 @@ async function translateMessage(messageId, options = {}) {
             presetName: prompt.name,
             displayMode: localOptions.displayMode,
             createdAt: new Date().toISOString(),
-            sourceHash: hashText(getMessageData(messageId)?.mes || ''),
+            sourceHash: hashText(sourceText),
         };
 
         updateMessageRecord(messageId, record => {
@@ -910,9 +992,9 @@ async function translateMessage(messageId, options = {}) {
             record.selectedId = version.id;
             record.visible = Boolean(localOptions.autoShow);
             record.displayMode = localOptions.displayMode;
-        });
+        }, recordKey);
 
-        if (localOptions.autoShow) applyDisplay(messageId);
+        if (localOptions.autoShow && getMessageRecordKey(messageId) === recordKey) applyDisplay(messageId);
         else updateButtonState(getMessageElement(messageId));
         refreshModalIfOpen(messageId);
         toastr?.success?.('楼层翻译完成。');
@@ -920,12 +1002,12 @@ async function translateMessage(messageId, options = {}) {
         updateMessageRecord(messageId, record => {
             record.status = 'error';
             record.statusText = error?.message || String(error);
-        });
+        }, recordKey);
         updateButtonState(getMessageElement(messageId));
         refreshModalIfOpen(messageId);
         toastr?.error?.(error?.message || String(error), '楼层翻译失败');
     } finally {
-        inFlight.delete(String(messageId));
+        inFlight.delete(recordKey);
         updateButtonState(getMessageElement(messageId));
         refreshModalIfOpen(messageId);
     }
@@ -1180,12 +1262,14 @@ function buildFloorModal(messageId) {
     const selectedLanguage = customLanguageSelected ? 'custom' : (record.language || settings.targetLanguage);
     const customLanguage = customLanguageSelected ? record.language : settings.customTargetLanguage;
     const selected = getSelectedVersion(record);
+    const replyLabel = getReplyLabel(messageId);
+    const titleSuffix = replyLabel ? ` · ${replyLabel}` : '';
 
     return `
         <div id="${MODAL_ID}" data-message-id="${escapeHtml(messageId)}">
             <div class="stft-modal-card">
                 <div class="stft-modal-head">
-                    <div class="stft-modal-title">楼层译文 ${escapeHtml(floor)}</div>
+                    <div class="stft-modal-title">楼层译文 ${escapeHtml(floor)}${escapeHtml(titleSuffix)}</div>
                     <div class="menu_button menu_button_icon fa-solid fa-xmark" data-stft-close title="关闭"></div>
                 </div>
                 <div class="stft-modal-body">
@@ -1219,7 +1303,7 @@ function buildFloorModal(messageId) {
                             <i class="fa-solid fa-language"></i><span>${record.visible ? '取消译文' : '显示译文'}</span>
                         </div>
                         <div id="stft_modal_delete_all" class="menu_button">
-                            <i class="fa-solid fa-trash-can"></i><span>清空本楼层译文</span>
+                            <i class="fa-solid fa-trash-can"></i><span>清空本回复译文</span>
                         </div>
                     </div>
                     <div class="stft-muted">当前选中：${selected ? escapeHtml(selected.presetName || '未命名') + ' / ' + escapeHtml(selected.language || '') : '没有译文版本'}</div>
@@ -1231,7 +1315,7 @@ function buildFloorModal(messageId) {
 
 function renderVersionList(messageId, record, message) {
     if (!record.versions?.length) {
-        return '<div class="stft-empty">这个楼层还没有保存的译文。点击“开始翻译”后，旧译文会留在这里供你切换、编辑或删除。</div>';
+        return '<div class="stft-empty">这个回复还没有保存的译文。点击“开始翻译”后，旧译文会留在这里供你切换、编辑或删除。</div>';
     }
 
     return record.versions.slice().reverse().map(version => {
@@ -1308,7 +1392,7 @@ function bindFloorModal(messageId) {
             record.selectedId = null;
             record.versions = [];
             record.status = 'idle';
-            record.statusText = '已清空本楼层译文。';
+            record.statusText = '已清空本回复译文。';
         });
         restoreDisplay(messageId, false);
         openFloorModal(messageId);
@@ -1432,14 +1516,36 @@ function bindEvents() {
         event_types.CHAT_CHANGED,
         event_types.CHARACTER_MESSAGE_RENDERED,
         event_types.USER_MESSAGE_RENDERED,
-        event_types.MESSAGE_UPDATED,
-        event_types.MESSAGE_SWIPED,
         event_types.GENERATION_ENDED,
         event_types.GENERATION_STOPPED,
     ];
     for (const eventName of eventsToScan) {
         eventSource.on(eventName, () => queueScan());
     }
+    eventSource.on(event_types.MESSAGE_UPDATED, payload => {
+        const messageId = getEventMessageId(payload);
+        queueScan();
+        refreshModalIfOpen(messageId);
+    });
+    eventSource.on(event_types.MESSAGE_SWIPED, payload => {
+        const messageId = getEventMessageId(payload);
+        queueScan();
+        refreshModalIfOpen(messageId);
+    });
+    eventSource.on(event_types.MESSAGE_SWIPE_DELETED, payload => {
+        const messageId = getEventMessageId(payload);
+        pruneMissingRecords();
+        queueScan();
+        refreshModalIfOpen(messageId);
+    });
+    eventSource.on(event_types.MESSAGE_DELETED, () => {
+        pruneMissingRecords();
+        queueScan();
+        const modalMessageId = $(`#${MODAL_ID}`).data('message-id');
+        if (modalMessageId !== undefined && !getMessageData(modalMessageId)) {
+            closeFloorModal();
+        }
+    });
 }
 
 function startObserver() {

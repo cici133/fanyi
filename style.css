@@ -78,13 +78,11 @@
 }
 
 .stft-compare-pair {
-    border-left: 2px solid var(--SmartThemeBorderColor, rgba(127, 127, 127, 0.35));
     margin: 0 0 0.85em;
-    padding-left: 0.75em;
 }
 
 .stft-compare-original {
-    opacity: 0.72;
+    opacity: 1;
 }
 
 .stft-compare-translation {
