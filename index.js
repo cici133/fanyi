@@ -1,4 +1,4 @@
-import { eventSource, event_types, saveSettingsDebounced } from '../../../../script.js';
+import { eventSource, event_types, getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
 import { extension_settings, getContext } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'floorTranslator';
@@ -21,6 +21,12 @@ const authModes = {
     xApiKey: 'x-api-key',
     custom: 'custom',
     none: 'none',
+};
+
+const requestModes = {
+    tavern: 'tavern',
+    standard: 'standard',
+    simple: 'simple',
 };
 
 const languages = [
@@ -91,6 +97,7 @@ const defaultSettings = {
     apiKey: '',
     authMode: authModes.bearer,
     customAuthHeader: 'Authorization',
+    requestMode: requestModes.tavern,
     temperature: 0.2,
     maxTokens: 4000,
     sourceLanguage: 'auto',
@@ -567,10 +574,18 @@ function normalizeEndpoint(endpoint) {
     return `${trimmed}/chat/completions`;
 }
 
-function buildHeaders() {
-    const headers = { 'Content-Type': 'application/json' };
+function normalizeBaseEndpoint(endpoint) {
+    return String(endpoint || '')
+        .trim()
+        .replace(/\/+$/, '')
+        .replace(/\/chat\/completions$/i, '');
+}
+
+function buildHeaders(mode = settings.requestMode) {
+    const simpleMode = mode === requestModes.simple;
+    const headers = simpleMode ? { 'Content-Type': 'text/plain' } : { 'Content-Type': 'application/json' };
     const key = String(settings.apiKey || '').trim();
-    if (!key || settings.authMode === authModes.none) return headers;
+    if (simpleMode || !key || settings.authMode === authModes.none) return headers;
 
     if (settings.authMode === authModes.bearer) {
         headers.Authorization = `Bearer ${key}`;
@@ -581,6 +596,84 @@ function buildHeaders() {
         headers[headerName] = key;
     }
     return headers;
+}
+
+function yamlLine(key, value) {
+    return `${String(key).replace(/[\r\n:]/g, '').trim()}: ${JSON.stringify(String(value ?? ''))}`;
+}
+
+function buildTavernBackendHeaders() {
+    const headers = { Authorization: '' };
+    const key = String(settings.apiKey || '').trim();
+
+    if (key && settings.authMode === authModes.bearer) {
+        headers.Authorization = `Bearer ${key}`;
+    } else if (key && settings.authMode === authModes.xApiKey) {
+        headers['x-api-key'] = key;
+    } else if (key && settings.authMode === authModes.custom) {
+        const headerName = String(settings.customAuthHeader || '').trim() || 'Authorization';
+        headers[headerName] = key;
+    }
+
+    return Object.entries(headers)
+        .filter(([name]) => name.trim())
+        .map(([name, value]) => yamlLine(name, value))
+        .join('\n');
+}
+
+async function requestViaTavernBackend(endpoint, body) {
+    const baseEndpoint = normalizeBaseEndpoint(settings.endpoint);
+    if (!baseEndpoint) throw new Error('请先在扩展设置里填写 OpenAI 兼容 API 地址。');
+
+    const payload = {
+        stream: false,
+        messages: body.messages,
+        model: body.model,
+        chat_completion_source: 'custom',
+        custom_url: baseEndpoint,
+        custom_include_headers: buildTavernBackendHeaders(),
+        temperature: body.temperature,
+        max_tokens: body.max_tokens,
+    };
+
+    Object.keys(payload).forEach(key => {
+        if (payload[key] === undefined) {
+            delete payload[key];
+        }
+    });
+
+    try {
+        return await fetch('/api/backends/chat-completions/generate', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            cache: 'no-cache',
+            body: JSON.stringify(payload),
+        });
+    } catch (error) {
+        const message = error?.message || String(error);
+        throw new Error(`请求没有发到酒馆内置生成通道：${message}。这是扩展调用酒馆已有接口，不需要额外后端插件；如果这里失败，请检查酒馆登录/CSRF 状态。`);
+    }
+}
+
+function directFetchErrorMessage(error, endpoint) {
+    const message = error?.message || String(error);
+    const endpointText = endpoint ? `地址：${endpoint}。` : '';
+    if (settings.requestMode === requestModes.simple) {
+        return `请求没有发到翻译 API：${message}。${endpointText}当前是“直连兼容模式”；如果仍失败，基本就是目标 API 没允许这个酒馆页面跨域访问，纯前端扩展无法绕过，需要 API/反代返回 CORS 头。`;
+    }
+    return `请求没有发到翻译 API：${message}。${endpointText}这通常是 CORS 预检、浏览器私有网络限制、端口不可达或手机访问的地址不对。你可以先试“直连兼容模式”，但如果 API 没开 CORS，纯前端扩展无法强行读取响应。`;
+}
+
+async function requestDirectly(endpoint, body) {
+    try {
+        return await fetch(endpoint, {
+            method: 'POST',
+            headers: buildHeaders(),
+            body: JSON.stringify(body),
+        });
+    } catch (error) {
+        throw new Error(directFetchErrorMessage(error, endpoint));
+    }
 }
 
 async function requestTranslationText(sourceText, options) {
@@ -600,17 +693,9 @@ async function requestTranslationText(sourceText, options) {
         body.max_tokens = maxTokens;
     }
 
-    let response;
-    try {
-        response = await fetch(endpoint, {
-            method: 'POST',
-            headers: buildHeaders(),
-            body: JSON.stringify(body),
-        });
-    } catch (error) {
-        const message = error?.message || String(error);
-        throw new Error(`请求没有发到翻译 API：${message}。手机端常见原因是 API 地址写了 127.0.0.1/localhost、HTTP/HTTPS 混用，或反代没有允许浏览器 CORS。`);
-    }
+    const response = settings.requestMode === requestModes.tavern
+        ? await requestViaTavernBackend(endpoint, body)
+        : await requestDirectly(endpoint, body);
 
     const text = await response.text();
     let data = null;
@@ -623,6 +708,10 @@ async function requestTranslationText(sourceText, options) {
     if (!response.ok) {
         const messageText = data?.error?.message || text || response.statusText;
         throw new Error(`API ${response.status}: ${messageText}`);
+    }
+    if (data?.error) {
+        const messageText = data?.error?.message || data?.error || text || '未知错误';
+        throw new Error(`API 返回错误：${messageText}`);
     }
 
     const translated = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? '';
@@ -755,6 +844,13 @@ function renderSettingsPanel() {
                                 <option value="${authModes.none}"${settings.authMode === authModes.none ? ' selected' : ''}>不发送密码</option>
                             </select>
                         </label>
+                        <label>请求方式
+                            <select id="stft_request_mode" class="text_pole">
+                                <option value="${requestModes.tavern}"${settings.requestMode === requestModes.tavern ? ' selected' : ''}>酒馆内置通道（推荐，无 CORS）</option>
+                                <option value="${requestModes.standard}"${settings.requestMode === requestModes.standard ? ' selected' : ''}>前端直连：标准 JSON</option>
+                                <option value="${requestModes.simple}"${settings.requestMode === requestModes.simple ? ' selected' : ''}>前端直连：兼容模式</option>
+                            </select>
+                        </label>
                         <label id="stft_custom_header_label">自定义请求头名
                             <input id="stft_custom_header" class="text_pole" value="${escapeHtml(settings.customAuthHeader)}">
                         </label>
@@ -801,7 +897,7 @@ function renderSettingsPanel() {
                         <div id="stft_test_api" class="menu_button"><i class="fa-solid fa-plug"></i><span>测试 API</span></div>
                     </div>
                     <div id="stft_global_status" class="stft-status stft-muted marginTop10">
-                        副 API 独立于酒馆主 API。纯前端直连反代时，反代需要允许浏览器 CORS。
+                        副 API 独立于酒馆主 API。推荐使用酒馆内置通道：不改酒馆本体，只调用酒馆已有生成接口。
                     </div>
                 </div>
             </div>
@@ -822,6 +918,10 @@ function bindSettingsPanel() {
     $('#stft_api_key').on('input', event => setAndSave('apiKey', event.target.value));
     $('#stft_auth_mode').on('change', event => {
         setAndSave('authMode', event.target.value);
+        refreshConditionalSettings();
+    });
+    $('#stft_request_mode').on('change', event => {
+        setAndSave('requestMode', event.target.value);
         refreshConditionalSettings();
     });
     $('#stft_custom_header').on('input', event => setAndSave('customAuthHeader', event.target.value.trim()));
@@ -853,7 +953,10 @@ function bindSettingsPanel() {
 }
 
 function refreshConditionalSettings() {
-    $('#stft_custom_header_label').toggle(settings.authMode === authModes.custom);
+    const simpleMode = settings.requestMode === requestModes.simple;
+    $('#stft_custom_header_label').toggle(settings.authMode === authModes.custom && !simpleMode);
+    $('#stft_api_key').closest('label').toggle(!simpleMode);
+    $('#stft_auth_mode').closest('label').toggle(!simpleMode);
     $('#stft_custom_language_label').toggle(settings.targetLanguage === 'custom');
 }
 
