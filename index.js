@@ -58,35 +58,63 @@ const languages = [
     ['custom', '自定义'],
 ];
 
+const languagePromptNames = {
+    auto: '自动识别',
+    'Chinese (Simplified)': '简体中文',
+    'Chinese (Traditional)': '繁体中文',
+    English: '英语',
+    Japanese: '日语',
+    Korean: '韩语',
+    French: '法语',
+    German: '德语',
+    Spanish: '西班牙语',
+    Italian: '意大利语',
+    Portuguese: '葡萄牙语',
+    Russian: '俄语',
+    Ukrainian: '乌克兰语',
+    Polish: '波兰语',
+    Dutch: '荷兰语',
+    Swedish: '瑞典语',
+    Norwegian: '挪威语',
+    Finnish: '芬兰语',
+    Danish: '丹麦语',
+    Turkish: '土耳其语',
+    Arabic: '阿拉伯语',
+    Hindi: '印地语',
+    Thai: '泰语',
+    Vietnamese: '越南语',
+    Indonesian: '印尼语',
+};
+
 const defaultPrompts = [
     {
         id: 'standard',
         name: '标准忠实翻译',
-        text: '你是一名严谨的文学翻译。请忠实、准确、自然地把正文翻译成{{target_language}}。不添加解释，不省略信息；已经是目标语言、专名、代码、标记或不应翻译的片段要原样复制。',
+        text: '你是一名严谨的文学翻译。请忠实、准确、自然地把正文翻译成{{target_language}}。如果正文不是{{target_language}}，必须翻译，不能照抄原文。不添加解释，不省略信息；只有已经是{{target_language}}、专名、代码、标记或不应翻译的片段才原样复制。',
         locked: true,
     },
     {
         id: 'ao3',
         name: 'AO3文手翻译风格',
-        text: '你是一名熟悉 AO3 同人文语感的译者。请把正文翻译成{{target_language}}，保留情绪张力、暧昧停顿、人物口吻和细腻心理描写。译文要流畅、有网文阅读感，但不要过度改写。',
+        text: '你是一名熟悉 AO3 同人文语感的译者。请把正文翻译成{{target_language}}。如果正文不是{{target_language}}，必须翻译，不能照抄原文。保留情绪张力、暧昧停顿、人物口吻和细腻心理描写。译文要流畅、有网文阅读感，但不要过度改写。',
         locked: true,
     },
     {
         id: 'euro_novel',
         name: '欧式著作翻译',
-        text: '你是一名欧陆文学译者。请把正文翻译成{{target_language}}，语体典雅、克制、具有文学质感，注意长句节奏、意象和叙述距离。不要添加注释。',
+        text: '你是一名欧陆文学译者。请把正文翻译成{{target_language}}。如果正文不是{{target_language}}，必须翻译，不能照抄原文。语体典雅、克制、具有文学质感，注意长句节奏、意象和叙述距离。不要添加注释。',
         locked: true,
     },
     {
         id: 'light_novel',
         name: '轻小说/网文润色',
-        text: '你是一名轻小说和中文网文译者。请把正文翻译成{{target_language}}，译文自然顺口，人物台词有辨识度，叙述节奏轻快，必要时做轻微本地化润色。',
+        text: '你是一名轻小说和中文网文译者。请把正文翻译成{{target_language}}。如果正文不是{{target_language}}，必须翻译，不能照抄原文。译文自然顺口，人物台词有辨识度，叙述节奏轻快，必要时做轻微本地化润色。',
         locked: true,
     },
     {
         id: 'localized',
         name: '自然口语本地化',
-        text: '你是一名本地化译者。请把正文翻译成{{target_language}}，优先保证读者读起来像目标语言原生表达，台词口语自然，叙事清楚。不要机械直译，不添加解释。',
+        text: '你是一名本地化译者。请把正文翻译成{{target_language}}。如果正文不是{{target_language}}，必须翻译，不能照抄原文。优先保证读者读起来像目标语言原生表达，台词口语自然，叙事清楚。不要机械直译，不添加解释。',
         locked: true,
     },
 ];
@@ -448,6 +476,10 @@ function resolveTargetLanguage(localValue = null, customValue = null) {
     return selected;
 }
 
+function getLanguagePromptName(value) {
+    return languagePromptNames[value] || String(value || '').trim() || '目标语言';
+}
+
 function getPromptById(id) {
     return settings.prompts.find(prompt => prompt.id === id) || settings.prompts[0] || defaultPrompts[0];
 }
@@ -458,19 +490,24 @@ function replacePromptVars(text, language, sourceLanguage) {
         .replace(/\{\{source_language\}\}/g, sourceLanguage || '自动识别');
 }
 
-function buildMessages(sourceText, language, presetId, sourceSegments = getSourceSegments(sourceText)) {
-    const sourceLanguage = settings.sourceLanguage === 'auto' ? '自动识别' : settings.sourceLanguage;
+function buildMessages(sourceText, language, presetId, sourceSegments = getSourceSegments(sourceText), forceTranslate = false) {
+    const sourceLanguage = settings.sourceLanguage === 'auto' ? '自动识别' : getLanguagePromptName(settings.sourceLanguage);
+    const targetLanguage = getLanguagePromptName(language);
     const prompt = getPromptById(presetId);
     const payload = {
         source_language: sourceLanguage,
-        target_language: language,
+        target_language: targetLanguage,
         rules: [
+            `目标语言是：${targetLanguage}。`,
+            'source_language 为“自动识别”时表示你要自己判断原文语言，不表示可以复制原文。',
+            `如果正文不是${targetLanguage}，必须翻译成${targetLanguage}，禁止把原文照抄到 translation。`,
             '只翻译正文，不翻译思维链、推理过程、system/developer/tool 内容或任何解释文字。',
             '不要输出思考过程，不要添加注释，不要使用 Markdown 代码块。',
             '保持 segments 数组长度、顺序和 id 完全一致。',
             '每个对象只填写对应 id 的 translation。',
-            '如果某段已经是目标语言、专名、代码、标记、章节编号或不应翻译的片段，请在 translation 中原样复制。',
-        ],
+            `只有某段本来就已经是${targetLanguage}，或者它只是专名、代码、标记、章节编号等不应翻译内容时，才可以原样复制。`,
+            forceTranslate ? `上一轮返回疑似照抄原文。请重新翻译，普通叙事和对话必须变成${targetLanguage}。` : '',
+        ].filter(Boolean),
         segments: sourceSegments.map(segment => ({
             id: segment.id,
             text: segment.source,
@@ -479,7 +516,10 @@ function buildMessages(sourceText, language, presetId, sourceSegments = getSourc
     return [
         {
             role: 'system',
-            content: replacePromptVars(prompt.text, language, sourceLanguage),
+            content: [
+                replacePromptVars(prompt.text, targetLanguage, sourceLanguage),
+                `最终目标语言：${targetLanguage}。如果输入不是${targetLanguage}，必须翻译，不要照抄原文。`,
+            ].join('\n'),
         },
         {
             role: 'user',
@@ -487,6 +527,7 @@ function buildMessages(sourceText, language, presetId, sourceSegments = getSourc
                 '下面是需要翻译的正文段落。请严格按 JSON 返回，禁止输出 JSON 以外的任何内容。',
                 '返回格式必须是：{"segments":[{"id":1,"translation":"..."}]}',
                 'translation 里可以包含换行，但不要新增、删除或合并段落 id。',
+                `目标语言再次确认：${targetLanguage}。`,
                 JSON.stringify(payload, null, 2),
             ].join('\n\n'),
         },
@@ -543,7 +584,7 @@ function normalizeReturnedSegments(parsed, sourceSegments) {
 
     return sourceSegments.map((sourceSegment, index) => {
         const item = byId.get(sourceSegment.id) || list[index] || {};
-        const rawTranslation = item.translation ?? item.translated_text ?? item.text ?? item.target ?? '';
+        const rawTranslation = pickTranslationText(item, sourceSegment.source);
         const translation = String(rawTranslation ?? '').trim() || sourceSegment.source;
         return {
             id: sourceSegment.id,
@@ -553,7 +594,76 @@ function normalizeReturnedSegments(parsed, sourceSegments) {
     });
 }
 
-function parseTranslationResponse(rawText, sourceText) {
+function pickTranslationText(item, sourceText) {
+    const direct = item?.translation
+        ?? item?.translated_text
+        ?? item?.translatedText
+        ?? item?.translated
+        ?? item?.target
+        ?? item?.target_text
+        ?? item?.targetText
+        ?? item?.output
+        ?? item?.result
+        ?? item?.译文;
+
+    if (direct !== undefined && direct !== null) {
+        return direct;
+    }
+
+    // Some small models return { id, text } for the translated text. Only accept
+    // it when it is not just the input segment echoed back.
+    const text = item?.text ?? item?.content;
+    if (text !== undefined && !isSameText(text, sourceText)) {
+        return text;
+    }
+
+    return '';
+}
+
+function normalizeComparableText(text) {
+    return String(text ?? '').replace(/\s+/g, '').trim();
+}
+
+function isSameText(a, b) {
+    return normalizeComparableText(a) === normalizeComparableText(b);
+}
+
+function hasLatinText(text) {
+    return /[A-Za-z]{3,}/.test(String(text ?? ''));
+}
+
+function hasCjkText(text) {
+    return /[\u3400-\u9FFF]/.test(String(text ?? ''));
+}
+
+function hasKanaText(text) {
+    return /[\u3040-\u30FF]/.test(String(text ?? ''));
+}
+
+function hasHangulText(text) {
+    return /[\uAC00-\uD7AF]/.test(String(text ?? ''));
+}
+
+function isChineseTarget(language) {
+    const value = String(language ?? '').toLowerCase();
+    return value.includes('chinese') || value.includes('中文') || value.includes('汉语') || value.includes('簡體') || value.includes('繁体') || value.includes('簡体');
+}
+
+function shouldTranslateSegment(source, targetLanguage) {
+    if (isChineseTarget(targetLanguage)) {
+        return (hasLatinText(source) && !hasCjkText(source)) || hasKanaText(source) || hasHangulText(source);
+    }
+    return false;
+}
+
+function isProbablyUntranslated(segments, targetLanguage) {
+    const candidates = segments.filter(segment => shouldTranslateSegment(segment.source, targetLanguage));
+    if (!candidates.length) return false;
+    const unchanged = candidates.filter(segment => isSameText(segment.source, segment.translation)).length;
+    return unchanged / candidates.length >= 0.5;
+}
+
+function parseTranslationResponse(rawText, sourceText, targetLanguage) {
     const sourceSegments = getSourceSegments(sourceText);
     const parsed = parseJsonLoose(rawText);
     const jsonSegments = parsed ? normalizeReturnedSegments(parsed, sourceSegments) : null;
@@ -564,6 +674,7 @@ function parseTranslationResponse(rawText, sourceText) {
         segments,
         raw: String(rawText ?? '').trim(),
         usedFallback: !jsonSegments?.length,
+        looksUntranslated: isProbablyUntranslated(segments, targetLanguage),
     };
 }
 
@@ -682,43 +793,59 @@ async function requestTranslationText(sourceText, options) {
     if (!settings.model) throw new Error('请先填写翻译模型名。');
     const sourceSegments = getSourceSegments(sourceText);
 
-    const body = {
-        model: settings.model,
-        messages: buildMessages(sourceText, options.language, options.presetId, sourceSegments),
-        temperature: Number(settings.temperature) || 0,
-        stream: false,
+    const buildBody = (forceTranslate = false) => {
+        const body = {
+            model: settings.model,
+            messages: buildMessages(sourceText, options.language, options.presetId, sourceSegments, forceTranslate),
+            temperature: Number(settings.temperature) || 0,
+            stream: false,
+        };
+        const maxTokens = Number(settings.maxTokens);
+        if (Number.isFinite(maxTokens) && maxTokens > 0) {
+            body.max_tokens = maxTokens;
+        }
+        return body;
     };
-    const maxTokens = Number(settings.maxTokens);
-    if (Number.isFinite(maxTokens) && maxTokens > 0) {
-        body.max_tokens = maxTokens;
-    }
 
-    const response = settings.requestMode === requestModes.tavern
-        ? await requestViaTavernBackend(endpoint, body)
-        : await requestDirectly(endpoint, body);
+    const sendAndParse = async (forceTranslate = false) => {
+        const body = buildBody(forceTranslate);
+        const response = settings.requestMode === requestModes.tavern
+            ? await requestViaTavernBackend(endpoint, body)
+            : await requestDirectly(endpoint, body);
 
-    const text = await response.text();
-    let data = null;
-    try {
-        data = text ? JSON.parse(text) : null;
-    } catch {
-        data = null;
-    }
+        const text = await response.text();
+        let data = null;
+        try {
+            data = text ? JSON.parse(text) : null;
+        } catch {
+            data = null;
+        }
 
-    if (!response.ok) {
-        const messageText = data?.error?.message || text || response.statusText;
-        throw new Error(`API ${response.status}: ${messageText}`);
-    }
-    if (data?.error) {
-        const messageText = data?.error?.message || data?.error || text || '未知错误';
-        throw new Error(`API 返回错误：${messageText}`);
-    }
+        if (!response.ok) {
+            const messageText = data?.error?.message || text || response.statusText;
+            throw new Error(`API ${response.status}: ${messageText}`);
+        }
+        if (data?.error) {
+            const messageText = data?.error?.message || data?.error || text || '未知错误';
+            throw new Error(`API 返回错误：${messageText}`);
+        }
 
-    const translated = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? '';
-    if (!String(translated).trim()) {
-        throw new Error('API 返回成功，但没有找到译文内容。');
+        const translated = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? '';
+        if (!String(translated).trim()) {
+            throw new Error('API 返回成功，但没有找到译文内容。');
+        }
+        return parseTranslationResponse(translated, sourceText, options.language);
+    };
+
+    let result = await sendAndParse(false);
+    if (result.looksUntranslated) {
+        result = await sendAndParse(true);
+        result.retriedForCopy = true;
+        if (result.looksUntranslated) {
+            throw new Error('模型返回的译文仍然基本等于原文，已拦截保存。请确认目标语言是中文，并换一个更听指令的翻译模型或提示词预设。');
+        }
     }
-    return parseTranslationResponse(translated, sourceText);
+    return result;
 }
 
 async function requestTranslation(messageId, options) {
@@ -767,9 +894,11 @@ async function translateMessage(messageId, options = {}) {
 
         updateMessageRecord(messageId, record => {
             record.status = 'success';
-            record.statusText = result.usedFallback
-                ? '翻译完成，但模型没有按 JSON 返回，已按段落尽量匹配。'
-                : '翻译完成。';
+            record.statusText = result.retriedForCopy
+                ? '翻译完成。第一次返回疑似照抄原文，已自动重试并保存第二次译文。'
+                : result.usedFallback
+                    ? '翻译完成，但模型没有按 JSON 返回，已按段落尽量匹配。'
+                    : '翻译完成。';
             record.versions.push(version);
             record.selectedId = version.id;
             record.visible = Boolean(localOptions.autoShow);
@@ -990,7 +1119,7 @@ function createPrompt() {
     const prompt = {
         id: makeId('prompt'),
         name: '自定义翻译预设',
-        text: '请把正文翻译成{{target_language}}，语气自然，忠实保留信息。已经是目标语言或不应翻译的片段请原样复制。',
+        text: '请把正文翻译成{{target_language}}，语气自然，忠实保留信息。如果正文不是{{target_language}}，必须翻译，不能照抄原文。只有已经是目标语言或不应翻译的片段请原样复制。',
         locked: false,
     };
     settings.prompts.push(prompt);
