@@ -51,8 +51,7 @@
     padding: 8px;
 }
 
-#chat .stft-toggle-button,
-#chat .stft-panel-button {
+#chat .stft-message-button {
     align-items: center;
     display: flex;
     font-size: 14px;

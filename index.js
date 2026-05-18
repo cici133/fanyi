@@ -5,8 +5,9 @@ const EXTENSION_NAME = 'floorTranslator';
 const STORAGE_PREFIX = 'stft-cache-v1';
 const SETTINGS_ID = 'stft_settings';
 const MODAL_ID = 'stft_modal';
-const TOGGLE_CLASS = 'stft-toggle-button';
-const PANEL_CLASS = 'stft-panel-button';
+const BUTTON_CLASS = 'stft-message-button';
+const LEGACY_TOGGLE_CLASS = 'stft-toggle-button';
+const LEGACY_PANEL_CLASS = 'stft-panel-button';
 const ACTIVE_CLASS = 'stft-button-active';
 const LOADING_CLASS = 'stft-button-loading';
 
@@ -55,31 +56,31 @@ const defaultPrompts = [
     {
         id: 'standard',
         name: '标准忠实翻译',
-        text: '你是一名严谨的文学翻译。请忠实、准确、自然地把文本翻译成{{target_language}}。保留原文段落数量和段落顺序，不添加解释，不省略信息，不输出代码块。',
+        text: '你是一名严谨的文学翻译。请忠实、准确、自然地把正文翻译成{{target_language}}。不添加解释，不省略信息；已经是目标语言、专名、代码、标记或不应翻译的片段要原样复制。',
         locked: true,
     },
     {
         id: 'ao3',
         name: 'AO3文手翻译风格',
-        text: '你是一名熟悉 AO3 同人文语感的译者。请把文本翻译成{{target_language}}，保留情绪张力、暧昧停顿、人物口吻和细腻心理描写。译文要流畅、有网文阅读感，但不要过度改写。保留段落数量和顺序，只输出译文。',
+        text: '你是一名熟悉 AO3 同人文语感的译者。请把正文翻译成{{target_language}}，保留情绪张力、暧昧停顿、人物口吻和细腻心理描写。译文要流畅、有网文阅读感，但不要过度改写。',
         locked: true,
     },
     {
         id: 'euro_novel',
         name: '欧式著作翻译',
-        text: '你是一名欧陆文学译者。请把文本翻译成{{target_language}}，语体典雅、克制、具有文学质感，注意长句节奏、意象和叙述距离。不要添加注释。保留段落数量和顺序，只输出译文。',
+        text: '你是一名欧陆文学译者。请把正文翻译成{{target_language}}，语体典雅、克制、具有文学质感，注意长句节奏、意象和叙述距离。不要添加注释。',
         locked: true,
     },
     {
         id: 'light_novel',
         name: '轻小说/网文润色',
-        text: '你是一名轻小说和中文网文译者。请把文本翻译成{{target_language}}，译文自然顺口，人物台词有辨识度，叙述节奏轻快，必要时做轻微本地化润色。保留段落数量和顺序，只输出译文。',
+        text: '你是一名轻小说和中文网文译者。请把正文翻译成{{target_language}}，译文自然顺口，人物台词有辨识度，叙述节奏轻快，必要时做轻微本地化润色。',
         locked: true,
     },
     {
         id: 'localized',
         name: '自然口语本地化',
-        text: '你是一名本地化译者。请把文本翻译成{{target_language}}，优先保证读者读起来像目标语言原生表达，台词口语自然，叙事清楚。不要机械直译，不添加解释。保留段落数量和顺序，只输出译文。',
+        text: '你是一名本地化译者。请把正文翻译成{{target_language}}，优先保证读者读起来像目标语言原生表达，台词口语自然，叙事清楚。不要机械直译，不添加解释。',
         locked: true,
     },
 ];
@@ -224,8 +225,12 @@ function updateMessageRecord(messageId, updater) {
     return record;
 }
 
+function lastItem(array) {
+    return Array.isArray(array) && array.length ? array[array.length - 1] : null;
+}
+
 function getSelectedVersion(record) {
-    return record.versions.find(version => version.id === record.selectedId) || record.versions.at(-1) || null;
+    return record.versions.find(version => version.id === record.selectedId) || lastItem(record.versions);
 }
 
 function getMessageElement(messageId) {
@@ -260,20 +265,60 @@ function renderMarkdown(text, messageId) {
 function splitParagraphs(text) {
     const normalized = String(text ?? '').replace(/\r\n/g, '\n').trim();
     if (!normalized) return [];
-    const blankSplit = normalized.split(/\n{2,}/).map(x => x.trim()).filter(Boolean);
+    const blankSplit = normalized.split(/\n\s*\n+/).map(x => x.trim()).filter(Boolean);
     if (blankSplit.length > 1) return blankSplit;
+    const lineSplit = normalized.split('\n').map(x => x.trim()).filter(Boolean);
+    if (lineSplit.length > 1) return lineSplit;
     return [normalized];
 }
 
-function renderCompareHtml(originalText, translatedText, messageId) {
-    const originals = splitParagraphs(originalText);
+function getSourceSegments(text) {
+    return splitParagraphs(text).map((source, index) => ({
+        id: index + 1,
+        source,
+    }));
+}
+
+function alignSegmentsFromText(originalText, translatedText) {
+    const originals = getSourceSegments(originalText);
     const translations = splitParagraphs(translatedText);
     const count = Math.max(originals.length, translations.length);
+    const segments = [];
+    for (let i = 0; i < count; i++) {
+        const source = originals[i]?.source ?? '';
+        const translation = translations[i] ?? source;
+        segments.push({
+            id: originals[i]?.id ?? i + 1,
+            source,
+            translation,
+        });
+    }
+    return segments;
+}
+
+function normalizeVersionSegments(version, originalText) {
+    const originalSegments = getSourceSegments(originalText);
+    if (Array.isArray(version?.segments) && version.segments.length) {
+        return version.segments.map((segment, index) => {
+            const source = String(segment.source ?? originalSegments[index]?.source ?? '').trim();
+            const translation = String(segment.translation ?? segment.text ?? source).trim();
+            return {
+                id: Number(segment.id) || originalSegments[index]?.id || index + 1,
+                source,
+                translation: translation || source,
+            };
+        });
+    }
+    return alignSegmentsFromText(originalText, version?.text ?? version ?? '');
+}
+
+function renderCompareHtml(originalText, version, messageId) {
+    const segments = normalizeVersionSegments(version, originalText);
     let html = '<div class="stft-render stft-compare-render">';
     html += '<div class="stft-translation-badge">译文对照</div>';
-    for (let i = 0; i < count; i++) {
-        const original = originals[i] ?? '';
-        const translation = translations[i] ?? '';
+    for (const segment of segments) {
+        const original = segment.source ?? '';
+        const translation = segment.translation ?? '';
         html += '<div class="stft-compare-pair">';
         if (original) html += `<div class="stft-compare-original">${renderMarkdown(original, messageId)}</div>`;
         if (translation) html += `<div class="stft-compare-translation">${renderMarkdown(translation, messageId)}</div>`;
@@ -304,7 +349,7 @@ function applyDisplay(messageId) {
     const mode = record.displayMode || version.displayMode || settings.displayMode;
     const html = mode === displayModes.replace
         ? renderReplaceHtml(version.text, messageId)
-        : renderCompareHtml(message.mes, version.text, messageId);
+        : renderCompareHtml(message.mes, version, messageId);
 
     if ($text.html() !== html) {
         $text.html(html);
@@ -338,11 +383,17 @@ function updateButtonState($mes) {
     const hasTranslation = Boolean(record?.versions?.length);
     const visible = Boolean(record?.visible && getSelectedVersion(record));
     const loading = inFlight.has(messageId);
-    $mes.find(`.${TOGGLE_CLASS}`)
+    const title = loading
+        ? '正在翻译...'
+        : visible
+            ? '取消译文 / 打开楼层译文面板'
+            : hasTranslation
+                ? '打开楼层译文面板'
+                : '开始楼层翻译';
+    $mes.find(`.${BUTTON_CLASS}`)
         .toggleClass(ACTIVE_CLASS, visible)
         .toggleClass(LOADING_CLASS, loading)
-        .attr('title', hasTranslation ? (visible ? '隐藏楼层译文' : '显示楼层译文') : '打开楼层翻译面板');
-    $mes.find(`.${PANEL_CLASS}`).toggleClass(ACTIVE_CLASS, hasTranslation);
+        .attr('title', title);
 }
 
 function queueScan() {
@@ -356,15 +407,16 @@ function queueScan() {
 function ensureMessageButtons() {
     $('#chat .mes').each((_, element) => {
         const $mes = $(element);
-        if (!isTranslatableMessage($mes)) return;
+        $mes.find(`.${LEGACY_TOGGLE_CLASS}, .${LEGACY_PANEL_CLASS}`).remove();
+        if (!isTranslatableMessage($mes)) {
+            $mes.find(`.${BUTTON_CLASS}`).remove();
+            return;
+        }
         const $buttons = $mes.find('.extraMesButtons').first();
         if (!$buttons.length) return;
 
-        if (!$buttons.find(`.${TOGGLE_CLASS}`).length) {
-            $buttons.append(`<div title="显示/隐藏楼层译文" class="mes_button ${TOGGLE_CLASS} fa-solid fa-language"></div>`);
-        }
-        if (!$buttons.find(`.${PANEL_CLASS}`).length) {
-            $buttons.append(`<div title="楼层翻译面板" class="mes_button ${PANEL_CLASS} fa-solid fa-gear"></div>`);
+        if (!$buttons.find(`.${BUTTON_CLASS}`).length) {
+            $buttons.append(`<div title="楼层翻译" class="mes_button ${BUTTON_CLASS} fa-solid fa-language"></div>`);
         }
         updateButtonState($mes);
     });
@@ -395,13 +447,28 @@ function getPromptById(id) {
 
 function replacePromptVars(text, language, sourceLanguage) {
     return String(text ?? '')
-        .replaceAll('{{target_language}}', language)
-        .replaceAll('{{source_language}}', sourceLanguage || '自动识别');
+        .replace(/\{\{target_language\}\}/g, language)
+        .replace(/\{\{source_language\}\}/g, sourceLanguage || '自动识别');
 }
 
-function buildMessages(sourceText, language, presetId) {
+function buildMessages(sourceText, language, presetId, sourceSegments = getSourceSegments(sourceText)) {
     const sourceLanguage = settings.sourceLanguage === 'auto' ? '自动识别' : settings.sourceLanguage;
     const prompt = getPromptById(presetId);
+    const payload = {
+        source_language: sourceLanguage,
+        target_language: language,
+        rules: [
+            '只翻译正文，不翻译思维链、推理过程、system/developer/tool 内容或任何解释文字。',
+            '不要输出思考过程，不要添加注释，不要使用 Markdown 代码块。',
+            '保持 segments 数组长度、顺序和 id 完全一致。',
+            '每个对象只填写对应 id 的 translation。',
+            '如果某段已经是目标语言、专名、代码、标记、章节编号或不应翻译的片段，请在 translation 中原样复制。',
+        ],
+        segments: sourceSegments.map(segment => ({
+            id: segment.id,
+            text: segment.source,
+        })),
+    };
     return [
         {
             role: 'system',
@@ -410,15 +477,87 @@ function buildMessages(sourceText, language, presetId) {
         {
             role: 'user',
             content: [
-                `源语言：${sourceLanguage}`,
-                `目标语言：${language}`,
-                '请翻译下面正文。保持段落数量和顺序，段落之间用空行分隔；不要输出解释、标题或代码块。',
-                '<正文>',
-                sourceText,
-                '</正文>',
+                '下面是需要翻译的正文段落。请严格按 JSON 返回，禁止输出 JSON 以外的任何内容。',
+                '返回格式必须是：{"segments":[{"id":1,"translation":"..."}]}',
+                'translation 里可以包含换行，但不要新增、删除或合并段落 id。',
+                JSON.stringify(payload, null, 2),
             ].join('\n\n'),
         },
     ];
+}
+
+function stripJsonFence(text) {
+    const value = String(text ?? '').trim();
+    const match = value.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    return match ? match[1].trim() : value;
+}
+
+function parseJsonLoose(text) {
+    const value = stripJsonFence(text);
+    try {
+        return JSON.parse(value);
+    } catch {
+        const objectStart = value.indexOf('{');
+        const objectEnd = value.lastIndexOf('}');
+        if (objectStart !== -1 && objectEnd > objectStart) {
+            try {
+                return JSON.parse(value.slice(objectStart, objectEnd + 1));
+            } catch {
+                // Fall through to array extraction.
+            }
+        }
+
+        const arrayStart = value.indexOf('[');
+        const arrayEnd = value.lastIndexOf(']');
+        if (arrayStart !== -1 && arrayEnd > arrayStart) {
+            try {
+                return JSON.parse(value.slice(arrayStart, arrayEnd + 1));
+            } catch {
+                return null;
+            }
+        }
+        return null;
+    }
+}
+
+function normalizeReturnedSegments(parsed, sourceSegments) {
+    const list = Array.isArray(parsed)
+        ? parsed
+        : parsed?.segments || parsed?.translations || parsed?.items || parsed?.result;
+    if (!Array.isArray(list)) return null;
+
+    const byId = new Map();
+    for (const item of list) {
+        const id = Number(item?.id ?? item?.index ?? item?.paragraph_id);
+        if (Number.isFinite(id)) {
+            byId.set(id, item);
+        }
+    }
+
+    return sourceSegments.map((sourceSegment, index) => {
+        const item = byId.get(sourceSegment.id) || list[index] || {};
+        const rawTranslation = item.translation ?? item.translated_text ?? item.text ?? item.target ?? '';
+        const translation = String(rawTranslation ?? '').trim() || sourceSegment.source;
+        return {
+            id: sourceSegment.id,
+            source: sourceSegment.source,
+            translation,
+        };
+    });
+}
+
+function parseTranslationResponse(rawText, sourceText) {
+    const sourceSegments = getSourceSegments(sourceText);
+    const parsed = parseJsonLoose(rawText);
+    const jsonSegments = parsed ? normalizeReturnedSegments(parsed, sourceSegments) : null;
+    const segments = jsonSegments?.length ? jsonSegments : alignSegmentsFromText(sourceText, rawText);
+    const text = segments.map(segment => segment.translation || segment.source).join('\n\n').trim();
+    return {
+        text,
+        segments,
+        raw: String(rawText ?? '').trim(),
+        usedFallback: !jsonSegments?.length,
+    };
 }
 
 function normalizeEndpoint(endpoint) {
@@ -448,10 +587,11 @@ async function requestTranslationText(sourceText, options) {
     const endpoint = normalizeEndpoint(settings.endpoint);
     if (!endpoint) throw new Error('请先在扩展设置里填写 OpenAI 兼容 API 地址。');
     if (!settings.model) throw new Error('请先填写翻译模型名。');
+    const sourceSegments = getSourceSegments(sourceText);
 
     const body = {
         model: settings.model,
-        messages: buildMessages(sourceText, options.language, options.presetId),
+        messages: buildMessages(sourceText, options.language, options.presetId, sourceSegments),
         temperature: Number(settings.temperature) || 0,
         stream: false,
     };
@@ -460,11 +600,17 @@ async function requestTranslationText(sourceText, options) {
         body.max_tokens = maxTokens;
     }
 
-    const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: buildHeaders(),
-        body: JSON.stringify(body),
-    });
+    let response;
+    try {
+        response = await fetch(endpoint, {
+            method: 'POST',
+            headers: buildHeaders(),
+            body: JSON.stringify(body),
+        });
+    } catch (error) {
+        const message = error?.message || String(error);
+        throw new Error(`请求没有发到翻译 API：${message}。手机端常见原因是 API 地址写了 127.0.0.1/localhost、HTTP/HTTPS 混用，或反代没有允许浏览器 CORS。`);
+    }
 
     const text = await response.text();
     let data = null;
@@ -483,7 +629,7 @@ async function requestTranslationText(sourceText, options) {
     if (!String(translated).trim()) {
         throw new Error('API 返回成功，但没有找到译文内容。');
     }
-    return String(translated).trim();
+    return parseTranslationResponse(translated, sourceText);
 }
 
 async function requestTranslation(messageId, options) {
@@ -515,11 +661,13 @@ async function translateMessage(messageId, options = {}) {
     refreshModalIfOpen(messageId);
 
     try {
-        const translated = await requestTranslation(messageId, localOptions);
+        const result = await requestTranslation(messageId, localOptions);
         const prompt = getPromptById(localOptions.presetId);
         const version = {
             id: makeId('ver'),
-            text: translated,
+            text: result.text,
+            segments: result.segments,
+            usedFallback: result.usedFallback,
             language: localOptions.language,
             presetId: localOptions.presetId,
             presetName: prompt.name,
@@ -530,7 +678,9 @@ async function translateMessage(messageId, options = {}) {
 
         updateMessageRecord(messageId, record => {
             record.status = 'success';
-            record.statusText = '翻译完成。';
+            record.statusText = result.usedFallback
+                ? '翻译完成，但模型没有按 JSON 返回，已按段落尽量匹配。'
+                : '翻译完成。';
             record.versions.push(version);
             record.selectedId = version.id;
             record.visible = Boolean(localOptions.autoShow);
@@ -737,7 +887,7 @@ function createPrompt() {
     const prompt = {
         id: makeId('prompt'),
         name: '自定义翻译预设',
-        text: '请把下面正文翻译成{{target_language}}。保持段落数量和顺序，只输出译文。',
+        text: '请把正文翻译成{{target_language}}，语气自然，忠实保留信息。已经是目标语言或不应翻译的片段请原样复制。',
         locked: false,
     };
     settings.prompts.push(prompt);
@@ -770,7 +920,7 @@ async function testApi() {
             language: resolveTargetLanguage(),
             presetId: settings.activePresetId,
         });
-        $('#stft_global_status').text(`API 测试成功：${result.slice(0, 120)}`);
+        $('#stft_global_status').text(`API 测试成功：${result.text.slice(0, 120)}`);
     } catch (error) {
         $('#stft_global_status').text(`API 测试失败：${error.message}`);
     }
@@ -824,7 +974,7 @@ function buildFloorModal(messageId) {
                             <i class="fa-solid fa-rotate"></i><span>${record.versions.length ? '刷新翻译' : '开始翻译'}</span>
                         </div>
                         <div id="stft_modal_toggle" class="menu_button">
-                            <i class="fa-solid fa-language"></i><span>${record.visible ? '隐藏译文' : '显示译文'}</span>
+                            <i class="fa-solid fa-language"></i><span>${record.visible ? '取消译文' : '显示译文'}</span>
                         </div>
                         <div id="stft_modal_delete_all" class="menu_button">
                             <i class="fa-solid fa-trash-can"></i><span>清空本楼层译文</span>
@@ -977,6 +1127,7 @@ function startEditVersion($version) {
             const target = nextRecord.versions.find(item => item.id === versionId);
             if (target) {
                 target.text = nextText;
+                target.segments = alignSegmentsFromText(getMessageData(messageId)?.mes || '', nextText);
                 target.editedAt = new Date().toISOString();
                 nextRecord.selectedId = versionId;
                 nextRecord.statusText = '译文已编辑保存。';
@@ -996,7 +1147,7 @@ function deleteVersion(messageId, versionId) {
     updateMessageRecord(messageId, record => {
         record.versions = record.versions.filter(item => item.id !== versionId);
         if (record.selectedId === versionId) {
-            record.selectedId = record.versions.at(-1)?.id || null;
+            record.selectedId = lastItem(record.versions)?.id || null;
         }
         if (!record.selectedId) {
             record.visible = false;
@@ -1025,25 +1176,9 @@ function toggleDisplay(messageId, fromModal = false) {
     if (fromModal) openFloorModal(messageId);
 }
 
-async function handleToggleClick(element) {
-    const $mes = $(element).closest('.mes');
-    const messageId = String($mes.attr('mesid'));
-    const { record } = getMessageRecord(messageId);
-    if (!getSelectedVersion(record)) {
-        openFloorModal(messageId);
-        return;
-    }
-    toggleDisplay(messageId);
-}
-
 function bindMessageButtons() {
     $(document).off('click.floorTranslator');
-    $(document).on('click.floorTranslator', `.${TOGGLE_CLASS}`, function (event) {
-        event.preventDefault();
-        event.stopPropagation();
-        void handleToggleClick(this);
-    });
-    $(document).on('click.floorTranslator', `.${PANEL_CLASS}`, function (event) {
+    $(document).on('click.floorTranslator', `.${BUTTON_CLASS}`, function (event) {
         event.preventDefault();
         event.stopPropagation();
         openFloorModal(String($(this).closest('.mes').attr('mesid')));
@@ -1073,14 +1208,19 @@ function startObserver() {
 }
 
 async function init() {
-    getSettings();
-    renderSettingsPanel();
-    bindMessageButtons();
-    bindEvents();
-    ensureMessageButtons();
-    startObserver();
-    reapplyVisibleDisplays();
-    console.info('[Floor Translator] loaded');
+    try {
+        getSettings();
+        renderSettingsPanel();
+        bindMessageButtons();
+        bindEvents();
+        ensureMessageButtons();
+        startObserver();
+        reapplyVisibleDisplays();
+        console.info('[Floor Translator] loaded');
+    } catch (error) {
+        console.error('[Floor Translator] init failed', error);
+        toastr?.error?.(error?.message || String(error), '楼层译文加载失败');
+    }
 }
 
-jQuery(init);
+jQuery(() => void init());
