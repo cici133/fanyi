@@ -171,8 +171,28 @@
     gap: 12px;
     overflow: auto;
     overscroll-behavior: auto;
-    padding-bottom: 16px;
+    padding-bottom: 56px;
     padding-right: 2px;
+}
+
+#stft_modal .stft-floating-edit-actions {
+    align-items: center;
+    background: var(--SmartThemeBlurTintColor, #1f1f1f);
+    border: 1px solid var(--SmartThemeBorderColor, rgba(127, 127, 127, 0.35));
+    border-radius: 8px;
+    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.18);
+    display: flex;
+    gap: 8px;
+    justify-content: space-between;
+    padding: 8px;
+    position: sticky;
+    top: 0;
+    z-index: 4;
+}
+
+#stft_modal .stft-floating-edit-actions > span {
+    font-size: 13px;
+    opacity: 0.78;
 }
 
 #stft_modal .stft-version-list {

@@ -2007,6 +2007,17 @@ function startEditVersion($version) {
     const version = record.versions.find(item => item.id === versionId);
     if (!version) return;
 
+    $(`#${MODAL_ID} .stft-floating-edit-actions`).remove();
+    const $floatingActions = $(`
+        <div class="stft-floating-edit-actions">
+            <span>正在编辑译文</span>
+            <div class="stft-row">
+                <div class="menu_button menu_button_icon fa-solid fa-check" data-stft-save title="保存"></div>
+                <div class="menu_button menu_button_icon fa-solid fa-xmark" data-stft-cancel title="取消"></div>
+            </div>
+        </div>`);
+    $(`#${MODAL_ID} .stft-modal-body`).prepend($floatingActions);
+
     $version.addClass('stft-version-editing');
     $version.find('.stft-version-head .stft-row').first()
         .addClass('stft-version-edit-actions stft-version-edit-actions-top')
@@ -2028,7 +2039,7 @@ function startEditVersion($version) {
         $version[0]?.scrollIntoView?.({ block: 'center', behavior: 'smooth' });
     });
 
-    $version.find('[data-stft-save]').on('click', event => {
+    const saveEdit = event => {
         event.stopPropagation();
         const nextText = String($version.find('.stft-version-editor').val() || '').trim();
         if (!nextText) {
@@ -2047,12 +2058,15 @@ function startEditVersion($version) {
         });
         applyDisplay(messageId);
         openFloorModal(messageId);
-    });
+    };
 
-    $version.find('[data-stft-cancel]').on('click', event => {
+    const cancelEdit = event => {
         event.stopPropagation();
         openFloorModal(messageId);
-    });
+    };
+
+    $version.find('[data-stft-save]').add($floatingActions.find('[data-stft-save]')).on('click', saveEdit);
+    $version.find('[data-stft-cancel]').add($floatingActions.find('[data-stft-cancel]')).on('click', cancelEdit);
 }
 
 function deleteVersion(messageId, versionId) {
