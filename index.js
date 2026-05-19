@@ -6,6 +6,7 @@ const STORAGE_PREFIX = 'stft-cache-v1';
 const SETTINGS_ID = 'stft_settings';
 const MODAL_ID = 'stft_modal';
 const BUTTON_CLASS = 'stft-message-button';
+const INLINE_TOGGLE_CLASS = 'stft-inline-toggle';
 const LEGACY_TOGGLE_CLASS = 'stft-toggle-button';
 const LEGACY_PANEL_CLASS = 'stft-panel-button';
 const ACTIVE_CLASS = 'stft-button-active';
@@ -35,7 +36,10 @@ const translationChannels = {
     microsoft: 'microsoft',
 };
 
+const BUILTIN_TRANSLATE_SWIPE_GUARD_KEY = '__floorTranslatorSwipeGuardInstalled';
+const builtinTranslateIncomingModes = new Set(['responses', 'both']);
 const machineConcurrency = 4;
+const googleChunkLength = 1300;
 
 const languages = [
     ['auto', '自动识别'],
@@ -180,6 +184,7 @@ const defaultSettings = {
     displayMode: displayModes.compare,
     autoShow: true,
     translateUserMessages: false,
+    suppressBuiltinSwipeTranslate: true,
     activePresetId: 'standard',
     prompts: defaultPrompts,
 };
@@ -212,6 +217,38 @@ function getSettings() {
 function saveSettings() {
     extension_settings[EXTENSION_NAME] = settings;
     saveSettingsDebounced();
+}
+
+function shouldSuppressBuiltinSwipeTranslate() {
+    return extension_settings[EXTENSION_NAME]?.suppressBuiltinSwipeTranslate !== false;
+}
+
+function installBuiltinSwipeTranslateGuard() {
+    if (eventSource[BUILTIN_TRANSLATE_SWIPE_GUARD_KEY]) return;
+
+    const originalEmit = eventSource.emit.bind(eventSource);
+    eventSource.emit = async function guardedEmit(eventName, ...args) {
+        const translateSettings = extension_settings.translate;
+        const originalAutoMode = translateSettings?.auto_mode;
+        const shouldMute = eventName === event_types.MESSAGE_SWIPED
+            && shouldSuppressBuiltinSwipeTranslate()
+            && builtinTranslateIncomingModes.has(originalAutoMode);
+
+        if (!shouldMute) {
+            return originalEmit(eventName, ...args);
+        }
+
+        translateSettings.auto_mode = 'none';
+        try {
+            return await originalEmit(eventName, ...args);
+        } finally {
+            if (translateSettings.auto_mode === 'none') {
+                translateSettings.auto_mode = originalAutoMode;
+            }
+        }
+    };
+
+    eventSource[BUILTIN_TRANSLATE_SWIPE_GUARD_KEY] = true;
 }
 
 function escapeHtml(value) {
@@ -381,6 +418,17 @@ function getSelectedVersion(record) {
     return record.versions.find(version => version.id === record.selectedId) || lastItem(record.versions);
 }
 
+function isDisplayableVersion(version) {
+    if (!version) return false;
+    if (String(version.text ?? '').trim()) return true;
+    return Array.isArray(version.segments) && version.segments.some(segment => String(segment.translation ?? '').trim());
+}
+
+function hasDisplayableVersion(record) {
+    if (!record?.versions?.length) return false;
+    return isDisplayableVersion(getSelectedVersion(record));
+}
+
 function getMessageElement(messageId) {
     return $(`#chat .mes[mesid="${cssEscape(messageId)}"]`).first();
 }
@@ -463,7 +511,7 @@ function normalizeVersionSegments(version, originalText) {
 function renderCompareHtml(originalText, version, messageId) {
     const segments = normalizeVersionSegments(version, originalText);
     let html = '<div class="stft-render stft-compare-render">';
-    html += '<div class="stft-translation-badge">译文对照</div>';
+    html += renderInlineToggleButton(messageId, true);
     for (const segment of segments) {
         const original = segment.source ?? '';
         const translation = segment.translation ?? '';
@@ -477,7 +525,15 @@ function renderCompareHtml(originalText, version, messageId) {
 }
 
 function renderReplaceHtml(translatedText, messageId) {
-    return `<div class="stft-render stft-replace-render"><div class="stft-translation-badge">译文</div>${renderMarkdown(translatedText, messageId)}</div>`;
+    return `<div class="stft-render stft-replace-render">${renderInlineToggleButton(messageId, true)}${renderMarkdown(translatedText, messageId)}</div>`;
+}
+
+function renderInlineToggleButton(messageId, visible = false) {
+    const label = visible ? '取消译文' : '显示译文';
+    const title = visible ? '取消当前楼层译文显示' : '显示这个回复已保存的译文';
+    return `<button type="button" class="${INLINE_TOGGLE_CLASS}${visible ? ' stft-inline-toggle-visible' : ''}" data-stft-inline-toggle data-message-id="${escapeHtml(messageId)}" title="${escapeHtml(title)}">
+        <i class="fa-solid fa-language"></i><span>${label}</span>
+    </button>`;
 }
 
 function applyDisplay(messageId) {
@@ -518,7 +574,9 @@ function restoreDisplay(messageId, updateRecord = true) {
     const message = getMessageData(messageId);
     const $text = $mes.find('.mes_text').first();
     if ($text.length && message) {
-        const originalHtml = renderMarkdown(message.mes, messageId);
+        const record = loadStore().messages[getMessageRecordKey(messageId)];
+        const hasTranslation = hasDisplayableVersion(record);
+        const originalHtml = `${hasTranslation ? renderInlineToggleButton(messageId, false) : ''}${renderMarkdown(message.mes, messageId)}`;
         if ($text.html() !== originalHtml) {
             $text.html(originalHtml);
         }
@@ -537,8 +595,8 @@ function updateButtonState($mes) {
     const store = loadStore();
     const recordKey = getMessageRecordKey(messageId);
     const record = store.messages[recordKey];
-    const hasTranslation = Boolean(record?.versions?.length);
-    const visible = Boolean(record?.visible && getSelectedVersion(record));
+    const hasTranslation = hasDisplayableVersion(record);
+    const visible = Boolean(record?.visible && hasTranslation);
     const loading = inFlight.has(recordKey);
     const title = loading
         ? '正在翻译...'
@@ -588,7 +646,7 @@ function reapplyVisibleDisplays() {
         if (record?.visible && getSelectedVersion(record)) {
             applyDisplay(messageId);
         } else {
-            if ($mes.find('.mes_text .stft-render').length) {
+            if (hasDisplayableVersion(record) || $mes.find(`.mes_text .stft-render, .mes_text .${INLINE_TOGGLE_CLASS}`).length) {
                 restoreDisplay(messageId, false);
             }
             updateButtonState($mes);
@@ -940,6 +998,21 @@ function directFetchErrorMessage(error, endpoint) {
     return `请求没有发到翻译 API：${message}。${endpointText}这通常是 CORS 预检、浏览器私有网络限制、端口不可达或手机访问的地址不对。你可以先试“直连兼容模式”，但如果 API 没开 CORS，纯前端扩展无法强行读取响应。`;
 }
 
+function compactHttpError(raw, fallback = '请求失败') {
+    const value = String(raw || fallback || '').trim();
+    if (!value) return fallback;
+    if (/^\s*<!doctype html|<html[\s>]/i.test(value)) {
+        return '服务器返回 HTML 错误页，通常是网页翻译端点拒绝了这次请求、文本过长，或网络代理改写了请求。';
+    }
+    const text = value
+        .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+        .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    return text.length > 260 ? `${text.slice(0, 260)}...` : text;
+}
+
 async function requestDirectly(endpoint, body) {
     try {
         return await fetch(endpoint, {
@@ -965,7 +1038,36 @@ function getMachineTargetCode(language, channel) {
     return target;
 }
 
+function splitMachineRequestChunks(text, maxLength = googleChunkLength) {
+    let rest = String(text ?? '').trim();
+    if (!rest || rest.length <= maxLength) return rest ? [rest] : [];
+
+    const chunks = [];
+    const sentenceMarks = ['\n', '。', '！', '？', '!', '?', '.', ';', '；', ',', '，', ' '];
+    while (rest.length > maxLength) {
+        let cut = -1;
+        for (const mark of sentenceMarks) {
+            const index = rest.lastIndexOf(mark, maxLength);
+            if (index > cut) cut = index + mark.length;
+        }
+        if (cut < Math.floor(maxLength * 0.45)) cut = maxLength;
+        chunks.push(rest.slice(0, cut).trim());
+        rest = rest.slice(cut).trim();
+    }
+    if (rest) chunks.push(rest);
+    return chunks.filter(Boolean);
+}
+
 async function translateWithGoogleWeb(text, targetLanguage) {
+    const chunks = splitMachineRequestChunks(text);
+    if (chunks.length > 1) {
+        const translatedChunks = [];
+        for (const chunk of chunks) {
+            translatedChunks.push(await translateWithGoogleWeb(chunk, targetLanguage));
+        }
+        return translatedChunks.join('\n');
+    }
+
     const target = getMachineTargetCode(targetLanguage, translationChannels.google);
     const source = getMachineSourceCode(translationChannels.google);
     const url = new URL('https://translate.googleapis.com/translate_a/single');
@@ -977,7 +1079,7 @@ async function translateWithGoogleWeb(text, targetLanguage) {
 
     const response = await fetch(url.toString(), { method: 'GET', cache: 'no-cache' });
     const raw = await response.text();
-    if (!response.ok) throw new Error(`Google 翻译 ${response.status}: ${raw || response.statusText}`);
+    if (!response.ok) throw new Error(`Google 翻译 ${response.status}: ${compactHttpError(raw, response.statusText)}`);
 
     let data;
     try {
@@ -1037,7 +1139,7 @@ async function translateWithMicrosoft(text, targetLanguage) {
         data = null;
     }
     if (!response.ok) {
-        const message = data?.error?.message || raw || response.statusText;
+        const message = compactHttpError(data?.error?.message || raw, response.statusText);
         throw new Error(`Microsoft 翻译 ${response.status}: ${message}`);
     }
     const translated = data?.[0]?.translations?.[0]?.text || '';
@@ -1261,8 +1363,12 @@ async function translateMessage(messageId, options = {}) {
                 record.displayMode = localOptions.displayMode;
             }, recordKey);
 
-            if (localOptions.autoShow && getMessageRecordKey(messageId) === recordKey) applyDisplay(messageId);
-            else updateButtonState(getMessageElement(messageId));
+            if (getMessageRecordKey(messageId) === recordKey) {
+                if (localOptions.autoShow) applyDisplay(messageId);
+                else restoreDisplay(messageId, false);
+            } else {
+                updateButtonState(getMessageElement(messageId));
+            }
             refreshModalIfOpen(messageId);
             toastr?.success?.(`${channelName} 翻译完成。`);
             return;
@@ -1296,8 +1402,12 @@ async function translateMessage(messageId, options = {}) {
             record.displayMode = localOptions.displayMode;
         }, recordKey);
 
-        if (localOptions.autoShow && getMessageRecordKey(messageId) === recordKey) applyDisplay(messageId);
-        else updateButtonState(getMessageElement(messageId));
+        if (getMessageRecordKey(messageId) === recordKey) {
+            if (localOptions.autoShow) applyDisplay(messageId);
+            else restoreDisplay(messageId, false);
+        } else {
+            updateButtonState(getMessageElement(messageId));
+        }
         refreshModalIfOpen(messageId);
         toastr?.success?.('楼层翻译完成。');
     } catch (error) {
@@ -1419,6 +1529,10 @@ function renderSettingsPanel() {
                             <input id="stft_translate_users" type="checkbox"${settings.translateUserMessages ? ' checked' : ''}>
                             用户消息也显示楼层翻译按钮
                         </label>
+                        <label class="checkbox_label stft-span-2" title="只在本扩展运行时拦截 message_swiped，不修改酒馆本体文件，也不保存改动到酒馆自带翻译设置。">
+                            <input id="stft_suppress_builtin_swipe_translate" type="checkbox"${settings.suppressBuiltinSwipeTranslate ? ' checked' : ''}>
+                            防止酒馆自带翻译在切换候选回复时自动触发
+                        </label>
                         <label class="stft-span-2 stft-ai-setting">当前预设名称
                             <input id="stft_prompt_name" class="text_pole" value="${escapeHtml(prompt.name)}">
                         </label>
@@ -1485,6 +1599,10 @@ function bindSettingsPanel() {
         setAndSave('translateUserMessages', event.target.checked);
         queueScan();
     });
+    $('#stft_suppress_builtin_swipe_translate').on('change', event => {
+        setAndSave('suppressBuiltinSwipeTranslate', event.target.checked);
+        refreshConditionalSettings();
+    });
     $('#stft_prompt_select').on('change', event => {
         settings.activePresetId = event.target.value;
         const prompt = getPromptById(settings.activePresetId);
@@ -1514,7 +1632,13 @@ function refreshConditionalSettings() {
             : microsoftChannel
                 ? 'Microsoft Translator 为快速机器翻译渠道，按段落并发请求，边返回边显示；需要填写 Key，区域资源再填写 Region。'
                 : 'Google 快速翻译为免密机器翻译渠道，按段落并发请求，边返回边显示；如果浏览器或网络拦截，会在楼层状态里报错。';
-        $('#stft_global_status').text(statusText);
+        const builtinMode = extension_settings.translate?.auto_mode;
+        const guardText = settings.suppressBuiltinSwipeTranslate && builtinTranslateIncomingModes.has(builtinMode)
+            ? ' 已拦截酒馆自带翻译的切换候选回复自动触发，避免未点击本扩展也出现 Google 红字。'
+            : settings.suppressBuiltinSwipeTranslate
+                ? ' 切换候选回复防红字已开启。'
+                : ' 切换候选回复防红字已关闭。';
+        $('#stft_global_status').text(`${statusText}${guardText}`);
     }
 }
 
@@ -1834,7 +1958,7 @@ function deleteVersion(messageId, versionId) {
 function toggleDisplay(messageId, fromModal = false) {
     const { record } = getMessageRecord(messageId);
     const selected = getSelectedVersion(record);
-    if (!selected) {
+    if (!isDisplayableVersion(selected)) {
         openFloorModal(messageId);
         return;
     }
@@ -1853,6 +1977,12 @@ function bindMessageButtons() {
         event.preventDefault();
         event.stopPropagation();
         openFloorModal(String($(this).closest('.mes').attr('mesid')));
+    });
+    $(document).on('click.floorTranslator', `.${INLINE_TOGGLE_CLASS}`, function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        const messageId = String($(this).data('message-id') || $(this).closest('.mes').attr('mesid'));
+        toggleDisplay(messageId, false);
     });
 }
 
@@ -1903,6 +2033,7 @@ function startObserver() {
 async function init() {
     try {
         getSettings();
+        installBuiltinSwipeTranslateGuard();
         renderSettingsPanel();
         bindMessageButtons();
         bindEvents();

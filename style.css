@@ -96,6 +96,34 @@
     opacity: 0.7;
 }
 
+#chat .stft-inline-toggle {
+    align-items: center;
+    background: rgba(128, 128, 128, 0.14);
+    border: 1px solid rgba(128, 128, 128, 0.34);
+    border-radius: 6px;
+    color: var(--SmartThemeBodyColor, inherit);
+    cursor: pointer;
+    display: inline-flex;
+    font: inherit;
+    font-size: 12px;
+    gap: 5px;
+    line-height: 1.2;
+    margin: 0 0 8px;
+    opacity: 0.78;
+    padding: 4px 9px;
+    touch-action: manipulation;
+}
+
+#chat .stft-inline-toggle:hover,
+#chat .stft-inline-toggle:focus-visible {
+    background: rgba(128, 128, 128, 0.24);
+    opacity: 1;
+}
+
+#chat .stft-inline-toggle-visible {
+    background: rgba(128, 128, 128, 0.2);
+}
+
 #stft_modal {
     align-items: center;
     background: rgba(0, 0, 0, 0.58);
