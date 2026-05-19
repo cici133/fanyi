@@ -1,4 +1,4 @@
-import { eventSource, event_types, getRequestHeaders, saveSettingsDebounced } from '../../../../script.js';
+import { eventSource, event_types, getRequestHeaders, saveSettingsDebounced, updateMessageBlock } from '../../../../script.js';
 import { extension_settings, getContext } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'floorTranslator';
@@ -497,11 +497,32 @@ function getSourceSegments(text) {
     }));
 }
 
+function createHtmlFenceRegex() {
+    // Accept code fences like ```html, ```htm, and common decorated labels
+    // such as ```html完整. Only the fence info string is flexible; the HTML
+    // body is still parsed structurally below.
+    return /(```[ \t]*(?:html|htm)[^\r\n]*\r?\n?)([\s\S]*?)(\r?\n?```)/gi;
+}
+
 function looksLikeStandaloneHtml(value) {
     const text = String(value ?? '').trim();
     return /^<!doctype\s+html/i.test(text)
         || /^<html[\s>]/i.test(text)
         || (/<body[\s>]/i.test(text) && /<\/body>/i.test(text));
+}
+
+function looksLikeHtmlDocumentSource(value) {
+    const text = String(value ?? '').trim();
+    if (!text) return false;
+    if (looksLikeStandaloneHtml(text)) return true;
+    const singleFence = text.match(/^```[ \t]*(?:html|htm)[^\r\n]*\r?\n?([\s\S]*?)\r?\n?```$/i);
+    if (singleFence && looksLikeStandaloneHtml(singleFence[1])) return true;
+    const fencedRegex = createHtmlFenceRegex();
+    let match;
+    while ((match = fencedRegex.exec(text))) {
+        if (looksLikeStandaloneHtml(match[2])) return true;
+    }
+    return false;
 }
 
 function shouldTranslateHtmlTextNode(node) {
@@ -580,7 +601,7 @@ function serializeHtmlBlockState(state) {
 
 function createHtmlTranslationPlan(sourceText) {
     const source = String(sourceText ?? '');
-    const fencedRegex = /(```(?:html|htm)\s*\n?)([\s\S]*?)(\n?```)/gi;
+    const fencedRegex = createHtmlFenceRegex();
     const blocks = [];
     const segments = [];
     let match;
@@ -736,10 +757,11 @@ function rememberOriginalRender(messageId, $text) {
     const recordKey = getMessageRecordKey(messageId);
     if (!$text?.length || originalRenderCache.has(recordKey)) return;
     if ($text.find('.stft-render').length) return;
+    if (looksLikeFormattedCodeBlock($text.html())) return;
     $text.children(`.${INLINE_TOGGLE_CLASS}, .${LEGACY_TOGGLE_CLASS}, .${LEGACY_PANEL_CLASS}`).remove();
     originalRenderCache.set(recordKey, {
         html: stripPluginChromeHtml($text.html()),
-        nodes: $text.contents().detach(),
+        nodes: $text.contents().clone(true, true),
         sourceHash: hashText(getMessageData(messageId)?.mes || ''),
     });
 }
@@ -775,10 +797,9 @@ function detachCachedOriginalNodes(messageId) {
 function restoreOriginalRenderNodes(messageId, $text, hasTranslation) {
     const cached = getValidOriginalRenderCache(messageId);
     if (!cached?.nodes?.length) return false;
-    cached.nodes = cached.nodes.detach();
     $text.empty();
     if (hasTranslation) $text.append($(renderInlineToggleButton(messageId, false)));
-    $text.append(cached.nodes);
+    $text.append(cached.nodes.clone(true, true));
     return true;
 }
 
@@ -802,7 +823,16 @@ function collectRenderedTextNodes(root) {
 }
 
 function isHtmlDocumentVersion(version) {
-    return Boolean(version?.htmlMode || version?.htmlSegments?.length || version?.segments?.some(segment => segment.kind === 'html_document'));
+    return Boolean(
+        version?.htmlMode
+        || version?.htmlSegments?.length
+        || looksLikeHtmlDocumentSource(version?.text)
+        || version?.segments?.some(segment => (
+            segment.kind === 'html_document'
+            || looksLikeHtmlDocumentSource(segment.source)
+            || looksLikeHtmlDocumentSource(segment.translation)
+        ))
+    );
 }
 
 function getHtmlVersionSegments(version) {
@@ -834,49 +864,37 @@ function applyTranslationsToRenderedHtml(html, htmlSegments) {
     return wrapper.innerHTML;
 }
 
-function stripHtmlFenceForFallback(value) {
-    const source = String(value ?? '').trim();
-    const single = source.match(/^```(?:html|htm)\s*\n?([\s\S]*?)\n?```$/i);
-    if (single) return single[1].trim();
-    return source.replace(/```(?:html|htm)\s*\n?([\s\S]*?)\n?```/gi, '$1');
-}
-
-function htmlCodeToInlineHtml(value) {
-    const html = stripHtmlFenceForFallback(value);
-    if (!looksLikeStandaloneHtml(html)) return html;
-    try {
-        const doc = new DOMParser().parseFromString(html, 'text/html');
-        const headContent = doc.head?.innerHTML || '';
-        const bodyContent = doc.body?.innerHTML || html;
-        return `${headContent}${bodyContent}`;
-    } catch {
-        return html;
-    }
-}
-
 function looksLikeFormattedCodeBlock(html) {
     const value = String(html ?? '');
-    return /<pre[\s\S]*<code/i.test(value) || /class=["'][^"']*(?:language-html|hljs|code)/i.test(value);
+    return /<pre[\s\S]*<code/i.test(value)
+        || /class=["'][^"']*(?:language-html|hljs|code)/i.test(value)
+        || /&lt;!(?:doctype)\s+html|&lt;html(?:\s|&gt;)|&lt;head(?:\s|&gt;)|&lt;body(?:\s|&gt;)|&lt;style(?:\s|&gt;)/i.test(value);
 }
 
 function renderOriginalHtmlDocument(messageId) {
-    const sourceHtml = getOriginalRenderHtml(messageId);
-    if (looksLikeFormattedCodeBlock(sourceHtml)) {
-        return htmlCodeToInlineHtml(getMessageData(messageId)?.mes || '');
-    }
-    return sourceHtml;
+    return renderMarkdown(getMessageData(messageId)?.mes || '', messageId);
+}
+
+function getHtmlDocumentVersionText(version) {
+    const text = String(version?.text ?? '').trim();
+    if (text) return version.text;
+    const documentSegment = version?.segments?.find(segment => segment.kind === 'html_document');
+    if (String(documentSegment?.translation ?? '').trim()) return documentSegment.translation;
+    if (String(version?.segments?.[0]?.translation ?? '').trim()) return version.segments[0].translation;
+    return '';
 }
 
 function renderHtmlDocumentVersion(messageId, version) {
+    const translatedHtmlText = getHtmlDocumentVersionText(version);
+    if (translatedHtmlText) {
+        return renderMarkdown(translatedHtmlText, messageId);
+    }
     const sourceHtml = getOriginalRenderHtml(messageId);
     const htmlSegments = getHtmlVersionSegments(version);
-    if (looksLikeFormattedCodeBlock(sourceHtml)) {
-        return htmlCodeToInlineHtml(version?.text || version?.segments?.[0]?.translation || '');
-    }
-    if (htmlSegments.length) {
+    if (htmlSegments.length && !looksLikeFormattedCodeBlock(sourceHtml)) {
         return applyTranslationsToRenderedHtml(sourceHtml, htmlSegments);
     }
-    return htmlCodeToInlineHtml(version?.text || version?.segments?.[0]?.translation || '');
+    return renderMarkdown(version?.segments?.[0]?.source || '', messageId);
 }
 
 function renderCompareHtml(originalText, version, messageId) {
@@ -936,6 +954,60 @@ function renderInlineToggleButton(messageId, visible = false) {
     </button>`;
 }
 
+function clearOriginalRenderCache(messageId) {
+    originalRenderCache.delete(getMessageRecordKey(messageId));
+}
+
+function emitNativeMessageRendered(messageId) {
+    const message = getMessageData(messageId);
+    if (!message) return;
+    const eventName = message.is_user ? event_types.USER_MESSAGE_RENDERED : event_types.CHARACTER_MESSAGE_RENDERED;
+    try {
+        void eventSource.emit(eventName, Number(messageId));
+    } catch (error) {
+        console.warn('[Floor Translator] message rendered event failed', error);
+    }
+}
+
+function rerenderNativeMessage(messageId) {
+    const message = getMessageData(messageId);
+    if (!message) return false;
+    try {
+        updateMessageBlock(Number(messageId), message);
+        clearOriginalRenderCache(messageId);
+        emitNativeMessageRendered(messageId);
+        return true;
+    } catch (error) {
+        console.warn('[Floor Translator] native message render failed', error);
+        return false;
+    }
+}
+
+function prependInlineToggleIfNeeded(messageId, $text, hasTranslation, visible) {
+    if (!$text?.length || !hasTranslation) return;
+    $text.children(`.${INLINE_TOGGLE_CLASS}, .${LEGACY_TOGGLE_CLASS}, .${LEGACY_PANEL_CLASS}`).remove();
+    $text.prepend($(renderInlineToggleButton(messageId, visible)));
+}
+
+function restoreNativeMessageDisplay(messageId, hasTranslation, renderKey) {
+    if (!rerenderNativeMessage(messageId)) return false;
+    const $text = getMessageElement(messageId).find('.mes_text').first();
+    $text.attr('data-stft-render-key', renderKey);
+
+    // HTML/front-end renderers usually run from the rendered-message event. Add
+    // our small toggle after that pass, and once more for slower mobile renders.
+    const addToggle = () => {
+        const $freshText = getMessageElement(messageId).find('.mes_text').first();
+        if (!$freshText.length) return;
+        prependInlineToggleIfNeeded(messageId, $freshText, hasTranslation, false);
+        $freshText.attr('data-stft-render-key', renderKey);
+    };
+    setTimeout(addToggle, 0);
+    setTimeout(addToggle, 160);
+    setTimeout(addToggle, 500);
+    return true;
+}
+
 function applyDisplay(messageId) {
     const $mes = getMessageElement(messageId);
     if (!$mes.length) return;
@@ -963,7 +1035,8 @@ function applyDisplay(messageId) {
 
     const mode = record.displayMode || version.displayMode || settings.displayMode;
     const renderKey = getTextRenderKey(messageId, mode, version);
-    if ($text.attr('data-stft-render-key') === renderKey && !(isHtmlDocumentVersion(version) && looksLikeFormattedCodeBlock($text.html()))) {
+    const htmlVersion = isHtmlDocumentVersion(version);
+    if ($text.attr('data-stft-render-key') === renderKey) {
         updateButtonState($mes);
         return;
     }
@@ -977,6 +1050,10 @@ function applyDisplay(messageId) {
         $text.html(html);
     }
     $text.attr('data-stft-render-key', renderKey);
+    if (htmlVersion) {
+        emitNativeMessageRendered(messageId);
+        setTimeout(() => emitNativeMessageRendered(messageId), 180);
+    }
     updateButtonState($mes);
 }
 
@@ -988,6 +1065,15 @@ function restoreDisplay(messageId, updateRecord = true) {
         const record = loadStore().messages[getMessageRecordKey(messageId)];
         const hasTranslation = hasDisplayableVersion(record);
         const renderKey = getTextRenderKey(messageId, hasTranslation ? 'original-toggle' : 'original');
+        if (restoreNativeMessageDisplay(messageId, hasTranslation, renderKey)) {
+            if (updateRecord) {
+                updateMessageRecord(messageId, nextRecord => {
+                    nextRecord.visible = false;
+                });
+            }
+            updateButtonState($mes);
+            return;
+        }
         const restoredNodes = restoreOriginalRenderNodes(messageId, $text, hasTranslation);
         const originalHtml = restoredNodes ? $text.html() : `${hasTranslation ? renderInlineToggleButton(messageId, false) : ''}${renderOriginalHtmlDocument(messageId)}`;
         if ($text.attr('data-stft-render-key') === renderKey && $text.html() === originalHtml) {
