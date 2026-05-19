@@ -498,10 +498,19 @@ function getSourceSegments(text) {
 }
 
 function createHtmlFenceRegex() {
-    // Accept code fences like ```html, ```htm, and common decorated labels
-    // such as ```html完整. Only the fence info string is flexible; the HTML
-    // body is still parsed structurally below.
-    return /(```[ \t]*(?:html|htm)[^\r\n]*\r?\n?)([\s\S]*?)(\r?\n?```)/gi;
+    // Accept any fenced block with 3+ backticks, then inspect the body before
+    // treating it as HTML. Some renderers rewrite ```html as ````html to protect
+    // nested fences; relying only on the info string makes extraction miss and
+    // sends the whole HTML document to machine translation.
+    return /((`{3,})[^\r\n]*\r?\n)([\s\S]*?)(\r?\n?\2)/g;
+}
+
+function getHtmlFenceBody(match) {
+    return match?.[3] ?? '';
+}
+
+function getHtmlFenceCloser(match) {
+    return match?.[4] ?? '';
 }
 
 function looksLikeStandaloneHtml(value) {
@@ -515,12 +524,12 @@ function looksLikeHtmlDocumentSource(value) {
     const text = String(value ?? '').trim();
     if (!text) return false;
     if (looksLikeStandaloneHtml(text)) return true;
-    const singleFence = text.match(/^```[ \t]*(?:html|htm)[^\r\n]*\r?\n?([\s\S]*?)\r?\n?```$/i);
-    if (singleFence && looksLikeStandaloneHtml(singleFence[1])) return true;
+    const singleFence = text.match(/^(`{3,})[^\r\n]*\r?\n([\s\S]*?)\r?\n?\1$/);
+    if (singleFence && looksLikeStandaloneHtml(singleFence[2])) return true;
     const fencedRegex = createHtmlFenceRegex();
     let match;
     while ((match = fencedRegex.exec(text))) {
-        if (looksLikeStandaloneHtml(match[2])) return true;
+        if (looksLikeStandaloneHtml(getHtmlFenceBody(match))) return true;
     }
     return false;
 }
@@ -697,13 +706,15 @@ function createHtmlTranslationPlan(sourceText) {
     let match;
 
     while ((match = fencedRegex.exec(source))) {
-        const blockState = createHtmlBlockState(match[2]);
+        const htmlBody = getHtmlFenceBody(match);
+        if (!looksLikeStandaloneHtml(htmlBody)) continue;
+        const blockState = createHtmlBlockState(htmlBody);
         if (!blockState) continue;
         blocks.push({
             start: match.index,
             end: match.index + match[0].length,
             opener: match[1],
-            closer: match[3],
+            closer: getHtmlFenceCloser(match),
             state: blockState,
         });
         for (const textNode of blockState.textNodes) {
@@ -973,8 +984,57 @@ function looksLikeFormattedCodeBlock(html) {
         || /&lt;!(?:doctype)\s+html|&lt;html(?:\s|&gt;)|&lt;head(?:\s|&gt;)|&lt;body(?:\s|&gt;)|&lt;style(?:\s|&gt;)/i.test(value);
 }
 
+function extractFirstHtmlDocumentSource(text) {
+    const source = String(text ?? '');
+    const fencedRegex = createHtmlFenceRegex();
+    let match;
+    while ((match = fencedRegex.exec(source))) {
+        const body = getHtmlFenceBody(match);
+        if (looksLikeStandaloneHtml(body)) return body.trim();
+    }
+    return looksLikeStandaloneHtml(source) ? source.trim() : '';
+}
+
+function renderHtmlIframeDocument(htmlSource, variant = 'translation') {
+    const source = String(htmlSource ?? '').trim();
+    if (!source) return '';
+    return `<div class="stft-html-frame-wrap stft-html-frame-${escapeHtml(variant)}">
+        <iframe class="stft-html-frame" loading="lazy" referrerpolicy="no-referrer" srcdoc="${escapeHtml(source)}"></iframe>
+    </div>`;
+}
+
+function bindHtmlFrameSizing(messageId) {
+    const $text = getMessageElement(messageId).find('.mes_text').first();
+    $text.find('iframe.stft-html-frame').each((_index, iframe) => {
+        if (iframe.dataset.stftSized === '1') {
+            resizeFallbackIframe(iframe);
+            return;
+        }
+        iframe.dataset.stftSized = '1';
+        iframe.addEventListener('load', () => {
+            resizeFallbackIframe(iframe);
+            setTimeout(() => resizeFallbackIframe(iframe), 120);
+            setTimeout(() => resizeFallbackIframe(iframe), 600);
+            try {
+                const doc = iframe.contentDocument;
+                if (doc && typeof ResizeObserver !== 'undefined') {
+                    const observer = new ResizeObserver(() => resizeFallbackIframe(iframe));
+                    observer.observe(doc.documentElement);
+                    if (doc.body) observer.observe(doc.body);
+                }
+            } catch {
+                // Some mobile WebViews refuse srcdoc sizing until after load.
+            }
+        });
+        resizeFallbackIframe(iframe);
+    });
+}
+
 function renderOriginalHtmlDocument(messageId) {
-    return renderMarkdown(getMessageData(messageId)?.mes || '', messageId);
+    const originalText = getMessageData(messageId)?.mes || '';
+    const htmlSource = extractFirstHtmlDocumentSource(originalText);
+    if (htmlSource) return renderHtmlIframeDocument(htmlSource, 'original');
+    return renderMarkdown(originalText, messageId);
 }
 
 function getHtmlDocumentVersionText(version, originalText = '') {
@@ -998,6 +1058,8 @@ function getHtmlDocumentVersionText(version, originalText = '') {
 function renderHtmlDocumentVersion(messageId, version) {
     const translatedHtmlText = getHtmlDocumentVersionText(version, getMessageData(messageId)?.mes || '');
     if (translatedHtmlText) {
+        const htmlSource = extractFirstHtmlDocumentSource(translatedHtmlText);
+        if (htmlSource) return renderHtmlIframeDocument(htmlSource, 'translation');
         return renderMarkdown(translatedHtmlText, messageId);
     }
     const sourceHtml = getOriginalRenderHtml(messageId);
@@ -1236,10 +1298,6 @@ function restoreNativeMessageDisplay(messageId, hasTranslation, renderKey) {
     setTimeout(addToggle, 0);
     setTimeout(addToggle, 160);
     setTimeout(addToggle, 500);
-    if (hasTranslation) {
-        setTimeout(() => renderFallbackFrontendCodeBlocks(messageId), 620);
-        setTimeout(() => renderFallbackFrontendCodeBlocks(messageId), 1200);
-    }
     return true;
 }
 
@@ -1256,8 +1314,6 @@ function applyNativeHtmlDocumentDisplay(messageId, displayText, hasTranslation, 
     setTimeout(addToggle, 0);
     setTimeout(addToggle, 180);
     setTimeout(addToggle, 560);
-    setTimeout(() => renderFallbackFrontendCodeBlocks(messageId), 680);
-    setTimeout(() => renderFallbackFrontendCodeBlocks(messageId), 1300);
     return true;
 }
 
@@ -1290,15 +1346,9 @@ function applyDisplay(messageId) {
     const renderKey = getTextRenderKey(messageId, mode, version);
     const htmlVersion = isHtmlDocumentVersion(version);
     if ($text.attr('data-stft-render-key') === renderKey) {
+        if (htmlVersion) bindHtmlFrameSizing(messageId);
         updateButtonState($mes);
         return;
-    }
-    if (htmlVersion) {
-        const nativeDisplayText = buildHtmlNativeDisplayText(message.mes, version, mode);
-        if (applyNativeHtmlDocumentDisplay(messageId, nativeDisplayText, true, true, renderKey)) {
-            updateButtonState($mes);
-            return;
-        }
     }
 
     rememberOriginalRender(messageId, $text);
@@ -1312,8 +1362,7 @@ function applyDisplay(messageId) {
     }
     $text.attr('data-stft-render-key', renderKey);
     if (htmlVersion) {
-        emitNativeMessageRendered(messageId);
-        setTimeout(() => emitNativeMessageRendered(messageId), 180);
+        bindHtmlFrameSizing(messageId);
     }
     updateButtonState($mes);
 }

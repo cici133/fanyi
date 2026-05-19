@@ -96,6 +96,21 @@
     display: none !important;
 }
 
+.stft-html-frame-wrap {
+    display: block;
+    margin: 0;
+    width: 100%;
+}
+
+.stft-html-frame {
+    background: transparent;
+    border: 0;
+    display: block;
+    min-height: 180px;
+    overflow: hidden;
+    width: 100%;
+}
+
 .stft-compare-pair {
     margin: 0 0 0.85em;
 }
