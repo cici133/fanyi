@@ -496,6 +496,187 @@ function getSourceSegments(text) {
     }));
 }
 
+function looksLikeStandaloneHtml(value) {
+    const text = String(value ?? '').trim();
+    return /^<!doctype\s+html/i.test(text)
+        || /^<html[\s>]/i.test(text)
+        || (/<body[\s>]/i.test(text) && /<\/body>/i.test(text));
+}
+
+function shouldTranslateHtmlTextNode(node) {
+    const value = String(node?.nodeValue ?? '');
+    const text = value.trim();
+    if (!text) return false;
+    if (!/[\p{L}\p{N}]/u.test(text)) return false;
+
+    const parent = node.parentElement;
+    if (!parent) return false;
+    if (parent.closest('script, style, code, pre, kbd, samp, textarea, svg, canvas, noscript')) return false;
+    return true;
+}
+
+function createHtmlBlockState(html) {
+    const source = String(html ?? '');
+    const isFullDocument = looksLikeStandaloneHtml(source);
+    const state = {
+        source,
+        isFullDocument,
+        document: null,
+        template: null,
+        textNodes: [],
+    };
+
+    try {
+        if (isFullDocument) {
+            state.document = new DOMParser().parseFromString(source, 'text/html');
+        } else {
+            state.template = document.createElement('template');
+            state.template.innerHTML = source;
+        }
+
+        const root = isFullDocument ? state.document.body : state.template.content;
+        if (!root) return null;
+
+        const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+            acceptNode(node) {
+                return shouldTranslateHtmlTextNode(node) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+            },
+        });
+
+        let node;
+        while ((node = walker.nextNode())) {
+            const raw = String(node.nodeValue ?? '');
+            const leading = raw.match(/^\s*/)?.[0] ?? '';
+            const trailing = raw.match(/\s*$/)?.[0] ?? '';
+            const core = raw.slice(leading.length, raw.length - trailing.length);
+            if (!core.trim()) continue;
+            state.textNodes.push({
+                node,
+                source: core,
+                leading,
+                trailing,
+            });
+        }
+        return state.textNodes.length ? state : null;
+    } catch (error) {
+        console.warn('[Floor Translator] HTML text extraction failed', error);
+        return null;
+    }
+}
+
+function serializeHtmlBlockState(state) {
+    if (!state) return '';
+    if (state.isFullDocument && state.document) {
+        const doctype = state.document.doctype
+            ? `<!DOCTYPE ${state.document.doctype.name}>`
+            : (/^<!doctype/i.test(state.source.trim()) ? '<!DOCTYPE html>' : '');
+        const html = state.document.documentElement?.outerHTML || state.source;
+        return `${doctype ? `${doctype}\n` : ''}${html}`;
+    }
+    if (state.template) return state.template.innerHTML;
+    return state.source;
+}
+
+function createHtmlTranslationPlan(sourceText) {
+    const source = String(sourceText ?? '');
+    const fencedRegex = /(```(?:html|htm)\s*\n?)([\s\S]*?)(\n?```)/gi;
+    const blocks = [];
+    const segments = [];
+    let match;
+
+    while ((match = fencedRegex.exec(source))) {
+        const blockState = createHtmlBlockState(match[2]);
+        if (!blockState) continue;
+        blocks.push({
+            start: match.index,
+            end: match.index + match[0].length,
+            opener: match[1],
+            closer: match[3],
+            state: blockState,
+        });
+        for (const textNode of blockState.textNodes) {
+            const id = segments.length + 1;
+            textNode.segmentId = id;
+            segments.push({
+                id,
+                source: textNode.source,
+                kind: 'html_text_node',
+            });
+        }
+    }
+
+    if (!blocks.length && looksLikeStandaloneHtml(source)) {
+        const leading = source.match(/^\s*/)?.[0] ?? '';
+        const trailing = source.match(/\s*$/)?.[0] ?? '';
+        const html = source.slice(leading.length, source.length - trailing.length);
+        const blockState = createHtmlBlockState(html);
+        if (blockState) {
+            blocks.push({
+                start: leading.length,
+                end: source.length - trailing.length,
+                opener: '',
+                closer: '',
+                state: blockState,
+            });
+            for (const textNode of blockState.textNodes) {
+                const id = segments.length + 1;
+                textNode.segmentId = id;
+                segments.push({
+                    id,
+                    source: textNode.source,
+                    kind: 'html_text_node',
+                });
+            }
+        }
+    }
+
+    return blocks.length && segments.length ? { source, blocks, segments } : null;
+}
+
+function applyHtmlTranslationPlan(plan, translatedSegments = []) {
+    if (!plan) return '';
+    const translations = new Map();
+    for (const segment of translatedSegments || []) {
+        translations.set(Number(segment.id), String(segment.translation ?? segment.text ?? '').trim());
+    }
+
+    for (const block of plan.blocks) {
+        for (const textNode of block.state.textNodes) {
+            const translation = translations.get(Number(textNode.segmentId));
+            textNode.node.nodeValue = `${textNode.leading}${translation || textNode.source}${textNode.trailing}`;
+        }
+    }
+
+    let output = '';
+    let cursor = 0;
+    for (const block of plan.blocks) {
+        output += plan.source.slice(cursor, block.start);
+        output += `${block.opener}${serializeHtmlBlockState(block.state)}${block.closer}`;
+        cursor = block.end;
+    }
+    output += plan.source.slice(cursor);
+    return output;
+}
+
+function makeHtmlTranslationResult(plan, translatedSegments, targetLanguage, raw = '', usedFallback = false) {
+    const htmlText = applyHtmlTranslationPlan(plan, translatedSegments);
+    const missingTranslationCount = translatedSegments.filter(segment => !String(segment.translation ?? '').trim()).length;
+    return {
+        text: htmlText,
+        segments: [{
+            id: 1,
+            source: plan.source,
+            translation: htmlText,
+            kind: 'html_document',
+        }],
+        raw: String(raw ?? '').trim(),
+        usedFallback,
+        looksUntranslated: isProbablyUntranslated(translatedSegments, targetLanguage),
+        missingTranslationCount,
+        htmlMode: true,
+    };
+}
+
 function alignSegmentsFromText(originalText, translatedText) {
     const originals = getSourceSegments(originalText);
     const translations = splitParagraphs(translatedText);
@@ -916,6 +1097,7 @@ function buildMessages(sourceText, language, presetId, sourceSegments = getSourc
     const sourceLanguage = settings.sourceLanguage === 'auto' ? '自动识别' : getLanguagePromptName(settings.sourceLanguage);
     const targetLanguage = getLanguagePromptName(language);
     const prompt = getPromptById(presetId);
+    const isHtmlNodeMode = sourceSegments.some(segment => segment.kind === 'html_text_node');
     const payload = {
         source_language: sourceLanguage,
         target_language: targetLanguage,
@@ -929,6 +1111,7 @@ function buildMessages(sourceText, language, presetId, sourceSegments = getSourc
             '每个返回对象只允许包含 id 和 translation，不要返回 source_text、text、source 或原始字段。',
             'translation 必须是 source_text 的译文，不是对 source_text 的复制。',
             `只有某段本来就已经是${targetLanguage}，或者它只是专名、代码、标记、章节编号等不应翻译内容时，才可以原样复制。`,
+            isHtmlNodeMode ? '这些 segments 来自 HTML 美化界面的可见文本节点。只翻译 source_text 的自然语言文字，不要返回 HTML 标签、属性、CSS、JavaScript 或 Markdown 代码块。' : '',
             forceTranslate ? `上一轮返回疑似照抄原文。请重新翻译，普通叙事和对话必须变成${targetLanguage}。` : '',
         ].filter(Boolean),
         segments: sourceSegments.map(segment => ({
@@ -1086,11 +1269,18 @@ function isProbablyUntranslated(segments, targetLanguage) {
     return unchanged / candidates.length >= 0.5;
 }
 
-function parseTranslationResponse(rawText, sourceText, targetLanguage) {
-    const sourceSegments = getSourceSegments(sourceText);
+function parseTranslationResponse(rawText, sourceText, targetLanguage, sourceSegments = getSourceSegments(sourceText), htmlPlan = null) {
     const parsed = parseJsonLoose(rawText);
     const jsonSegments = parsed ? normalizeReturnedSegments(parsed, sourceSegments) : null;
-    const segments = jsonSegments?.length ? jsonSegments : alignSegmentsFromText(sourceText, rawText);
+    const segments = jsonSegments?.length
+        ? jsonSegments
+        : sourceSegments.map((segment, index) => ({
+            ...segment,
+            translation: splitParagraphs(rawText)[index] || '',
+        }));
+    if (htmlPlan) {
+        return makeHtmlTranslationResult(htmlPlan, segments, targetLanguage, rawText, !jsonSegments?.length);
+    }
     const text = segments.map(segment => segment.translation || '').filter(Boolean).join('\n\n').trim();
     const missingTranslationCount = segments.filter(segment => !String(segment.translation ?? '').trim()).length;
     return {
@@ -1376,8 +1566,7 @@ function extractPartialTranslationValues(rawText) {
     return results.filter(Boolean);
 }
 
-function parsePartialTranslationProgress(rawText, sourceText, targetLanguage) {
-    const sourceSegments = getSourceSegments(sourceText);
+function parsePartialTranslationProgress(rawText, sourceText, targetLanguage, sourceSegments = getSourceSegments(sourceText), htmlPlan = null) {
     const partialTranslations = extractPartialTranslationValues(rawText);
     let segments;
 
@@ -1391,7 +1580,18 @@ function parsePartialTranslationProgress(rawText, sourceText, targetLanguage) {
         const likelyJson = /^[\s`]*[\[{]/.test(text) || /"segments"|"translation"/.test(text);
         segments = likelyJson
             ? sourceSegments.map(segment => ({ ...segment, translation: '' }))
-            : alignSegmentsFromText(sourceText, text);
+            : htmlPlan
+                ? sourceSegments.map((segment, index) => ({ ...segment, translation: splitParagraphs(text)[index] || '' }))
+                : alignSegmentsFromText(sourceText, text);
+    }
+
+    if (htmlPlan) {
+        const htmlResult = makeHtmlTranslationResult(htmlPlan, segments, targetLanguage, rawText, !partialTranslations.length);
+        return {
+            ...htmlResult,
+            completed: segments.filter(segment => String(segment.translation || '').trim()).length,
+            total: sourceSegments.length,
+        };
     }
 
     return {
@@ -1527,10 +1727,12 @@ async function translateWithMicrosoft(text, targetLanguage) {
 
 async function requestMachineTranslationText(sourceText, options, onProgress) {
     const channel = options.channel || settings.translationChannel;
-    const sourceSegments = getSourceSegments(sourceText);
+    const htmlPlan = createHtmlTranslationPlan(sourceText);
+    const sourceSegments = htmlPlan?.segments || getSourceSegments(sourceText);
     const resultSegments = sourceSegments.map(segment => ({
         id: segment.id,
         source: segment.source,
+        kind: segment.kind,
         translation: '',
     }));
     let completed = 0;
@@ -1539,10 +1741,14 @@ async function requestMachineTranslationText(sourceText, options, onProgress) {
     const translateOne = channel === translationChannels.microsoft ? translateWithMicrosoft : translateWithGoogleWeb;
 
     const emitProgress = () => {
-        const text = resultSegments.map(segment => segment.translation || '').filter(Boolean).join('\n\n').trim();
+        const progressResult = htmlPlan
+            ? makeHtmlTranslationResult(htmlPlan, resultSegments, options.language, '', false)
+            : {
+                text: resultSegments.map(segment => segment.translation || '').filter(Boolean).join('\n\n').trim(),
+                segments: resultSegments.map(segment => ({ ...segment })),
+            };
         onProgress?.({
-            text,
-            segments: resultSegments.map(segment => ({ ...segment })),
+            ...progressResult,
             completed,
             total,
             channel,
@@ -1562,6 +1768,16 @@ async function requestMachineTranslationText(sourceText, options, onProgress) {
 
     const workers = Array.from({ length: Math.min(machineConcurrency, Math.max(total, 1)) }, () => worker());
     await Promise.all(workers);
+    if (htmlPlan) {
+        const htmlResult = makeHtmlTranslationResult(htmlPlan, resultSegments, options.language, '', false);
+        if (!htmlResult.text) throw new Error(`${getChannelName(channel)} 没有生成译文。`);
+        return {
+            ...htmlResult,
+            raw: htmlResult.text,
+            usedFallback: false,
+        };
+    }
+
     const text = resultSegments.map(segment => segment.translation || '').filter(Boolean).join('\n\n').trim();
     if (!text) throw new Error(`${getChannelName(channel)} 没有生成译文。`);
     return {
@@ -1577,7 +1793,8 @@ async function requestTranslationText(sourceText, options, onProgress) {
     const endpoint = normalizeEndpoint(settings.endpoint);
     if (!endpoint) throw new Error('请先在扩展设置里填写副 API / 反代地址。');
     if (!settings.model) throw new Error('请先填写翻译模型名。');
-    const sourceSegments = getSourceSegments(sourceText);
+    const htmlPlan = createHtmlTranslationPlan(sourceText);
+    const sourceSegments = htmlPlan?.segments || getSourceSegments(sourceText);
 
     const buildBody = (forceTranslate = false, stream = false) => {
         const body = {
@@ -1620,7 +1837,7 @@ async function requestTranslationText(sourceText, options, onProgress) {
         if (!String(translated).trim()) {
             throw new Error('API 返回成功，但没有找到译文内容。');
         }
-        return parseTranslationResponse(translated, sourceText, options.language);
+        return parseTranslationResponse(translated, sourceText, options.language, sourceSegments, htmlPlan);
     };
 
     const sendStreamAndParse = async (forceTranslate = false) => {
@@ -1631,12 +1848,12 @@ async function requestTranslationText(sourceText, options, onProgress) {
 
         let lastProgressText = '';
         const rawText = await readChatCompletionStream(response, partialText => {
-            const parsed = parsePartialTranslationProgress(partialText, sourceText, options.language);
+            const parsed = parsePartialTranslationProgress(partialText, sourceText, options.language, sourceSegments, htmlPlan);
             if (parsed.text && parsed.text !== lastProgressText) {
                 lastProgressText = parsed.text;
                 onProgress?.({
                     ...parsed,
-                    completed: parsed.segments.filter(segment => String(segment.translation || '').trim()).length,
+                    completed: parsed.completed ?? parsed.segments.filter(segment => String(segment.translation || '').trim()).length,
                     total: sourceSegments.length,
                     channel: translationChannels.ai,
                 });
@@ -1646,7 +1863,7 @@ async function requestTranslationText(sourceText, options, onProgress) {
         if (!String(rawText).trim()) {
             throw new Error('API 流式响应结束了，但没有拿到译文内容。');
         }
-        return parseTranslationResponse(rawText, sourceText, options.language);
+        return parseTranslationResponse(rawText, sourceText, options.language, sourceSegments, htmlPlan);
     };
 
     if (options.progressMode === progressModes.stream && typeof onProgress === 'function') {
@@ -1700,6 +1917,17 @@ async function translateMessage(messageId, options = {}) {
     localOptions.progressMode = channel === translationChannels.ai
         ? (settings.aiProgressMode || progressModes.final)
         : (settings.machineProgressMode || progressModes.stream);
+    const htmlPlanForInitial = createHtmlTranslationPlan(sourceText);
+    const sourceSegmentsForTranslation = htmlPlanForInitial?.segments || getSourceSegments(sourceText);
+    const initialVersionSegments = htmlPlanForInitial
+        ? makeHtmlTranslationResult(
+            htmlPlanForInitial,
+            sourceSegmentsForTranslation.map(segment => ({ ...segment, translation: '' })),
+            localOptions.language,
+            '',
+            false,
+        ).segments
+        : sourceSegmentsForTranslation.map(segment => ({ ...segment, translation: '' }));
 
     inFlight.set(recordKey, true);
     updateMessageRecord(messageId, record => {
@@ -1715,12 +1943,11 @@ async function translateMessage(messageId, options = {}) {
     try {
         if (channel !== translationChannels.ai) {
             const versionId = makeId('ver');
-            const sourceSegments = getSourceSegments(sourceText);
             const streamProgress = localOptions.progressMode === progressModes.stream;
             const version = {
                 id: versionId,
                 text: '',
-                segments: sourceSegments.map(segment => ({ ...segment, translation: '' })),
+                segments: initialVersionSegments.map(segment => ({ ...segment })),
                 usedFallback: false,
                 language: localOptions.language,
                 presetId: channel,
@@ -1733,7 +1960,7 @@ async function translateMessage(messageId, options = {}) {
 
             updateMessageRecord(messageId, record => {
                 record.status = 'loading';
-                record.statusText = `正在使用${channelName}快速翻译 0/${sourceSegments.length}...`;
+                record.statusText = `正在使用${channelName}快速翻译 0/${sourceSegmentsForTranslation.length}...`;
                 record.versions.push(version);
                 record.selectedId = version.id;
                 record.visible = Boolean(localOptions.autoShow && streamProgress);
@@ -1741,7 +1968,7 @@ async function translateMessage(messageId, options = {}) {
             }, recordKey);
 
             const progressRenderer = streamProgress
-                ? makeProgressRenderer(messageId, recordKey, version, localOptions, channelName, sourceSegments.length)
+                ? makeProgressRenderer(messageId, recordKey, version, localOptions, channelName, sourceSegmentsForTranslation.length)
                 : null;
             if (streamProgress) {
                 setLiveTranslation(recordKey, version);
@@ -1792,7 +2019,7 @@ async function translateMessage(messageId, options = {}) {
         const version = {
             id: makeId('ver'),
             text: '',
-            segments: getSourceSegments(sourceText).map(segment => ({ ...segment, translation: '' })),
+            segments: initialVersionSegments.map(segment => ({ ...segment })),
             usedFallback: false,
             language: localOptions.language,
             presetId: localOptions.presetId,
@@ -1813,7 +2040,7 @@ async function translateMessage(messageId, options = {}) {
                 record.displayMode = localOptions.displayMode;
             }, recordKey);
             setLiveTranslation(recordKey, version);
-            progressRenderer = makeProgressRenderer(messageId, recordKey, version, localOptions, channelName, version.segments.length);
+            progressRenderer = makeProgressRenderer(messageId, recordKey, version, localOptions, channelName, sourceSegmentsForTranslation.length);
             if (localOptions.autoShow && getMessageRecordKey(messageId) === recordKey) applyDisplay(messageId);
         }
 
