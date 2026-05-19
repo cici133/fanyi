@@ -30,6 +30,11 @@ const requestModes = {
     simple: 'simple',
 };
 
+const progressModes = {
+    stream: 'stream',
+    final: 'final',
+};
+
 const backendCompatModes = {
     openaiProxy: 'openai-proxy',
     custom: 'custom',
@@ -179,6 +184,8 @@ const defaultSettings = {
     customAuthHeader: 'Authorization',
     requestMode: requestModes.tavern,
     backendCompatMode: backendCompatModes.openaiProxy,
+    aiProgressMode: progressModes.stream,
+    machineProgressMode: progressModes.stream,
     microsoftKey: '',
     microsoftRegion: '',
     microsoftEndpoint: 'https://api.cognitive.microsofttranslator.com',
@@ -203,6 +210,8 @@ const pendingScanMessageIds = new Set();
 let fullScanToken = 0;
 let observer = null;
 const inFlight = new Map();
+const liveTranslations = new Map();
+const mutedLiveDisplays = new Set();
 
 function clone(value) {
     return JSON.parse(JSON.stringify(value));
@@ -536,13 +545,24 @@ function renderCompareHtml(originalText, version, messageId) {
     return html;
 }
 
-function renderReplaceHtml(translatedText, messageId) {
-    return `<div class="stft-render stft-replace-render">${renderInlineToggleButton(messageId, true)}${renderMarkdown(translatedText, messageId)}</div>`;
+function getReplaceText(originalText, version) {
+    const segments = normalizeVersionSegments(version, originalText);
+    if (segments.length) {
+        return segments
+            .map(segment => String(segment.translation || segment.source || '').trim())
+            .filter(Boolean)
+            .join('\n\n');
+    }
+    return String(version?.text ?? '').trim();
+}
+
+function renderReplaceHtml(originalText, version, messageId) {
+    return `<div class="stft-render stft-replace-render">${renderInlineToggleButton(messageId, true)}${renderMarkdown(getReplaceText(originalText, version), messageId)}</div>`;
 }
 
 function getTextRenderKey(messageId, mode, version = null) {
     const versionStamp = version
-        ? `${version.id || ''}:${version.editedAt || version.createdAt || ''}:${hashText(version.text || '')}`
+        ? `${version.id || ''}:${version.editedAt || version.createdAt || ''}:${hashText(version.text || JSON.stringify(version.segments || []))}`
         : '';
     return `${getMessageRecordKey(messageId)}:${mode}:${versionStamp}`;
 }
@@ -560,7 +580,10 @@ function applyDisplay(messageId) {
     if (!$mes.length) return;
     const message = getMessageData(messageId);
     const { record } = getMessageRecord(messageId);
-    const version = getSelectedVersion(record);
+    const recordKey = getMessageRecordKey(messageId);
+    const live = liveTranslations.get(recordKey);
+    const storedVersion = getSelectedVersion(record);
+    const version = live?.versionId === record.selectedId ? live.version : storedVersion;
     const $text = $mes.find('.mes_text').first();
 
     if (!$text.length || !record.visible || !version || !message) {
@@ -584,7 +607,7 @@ function applyDisplay(messageId) {
         return;
     }
     const html = mode === displayModes.replace
-        ? renderReplaceHtml(version.text, messageId)
+        ? renderReplaceHtml(message.mes, version, messageId)
         : renderCompareHtml(message.mes, version, messageId);
 
     if ($text.html() !== html) {
@@ -631,7 +654,7 @@ function updateButtonState($mes, store = null, recordKey = null) {
     if (!store) store = loadStore();
     if (!recordKey) recordKey = getMessageRecordKey(messageId);
     const record = store.messages[recordKey];
-    const hasTranslation = hasDisplayableVersion(record);
+    const hasTranslation = hasDisplayableVersion(record) || liveTranslations.has(recordKey);
     const visible = Boolean(record?.visible && hasTranslation);
     const loading = inFlight.has(recordKey);
     const title = loading
@@ -760,6 +783,78 @@ function ensureHiddenInlineToggle($mes, messageId) {
 
 function reapplyVisibleDisplays(store = loadStore()) {
     scanMessageElements($('#chat .mes'), store);
+}
+
+function setLiveTranslation(recordKey, version) {
+    liveTranslations.set(String(recordKey), {
+        versionId: version.id,
+        version,
+    });
+}
+
+function clearLiveTranslation(recordKey) {
+    const key = String(recordKey);
+    liveTranslations.delete(key);
+    mutedLiveDisplays.delete(key);
+}
+
+function makeProgressRenderer(messageId, recordKey, version, localOptions, channelName, total = 0) {
+    let lastRenderAt = 0;
+    let pending = null;
+    let frame = 0;
+    const renderInterval = 90;
+    const statusInterval = 650;
+    let lastStatusAt = 0;
+
+    const flush = () => {
+        frame = 0;
+        if (!pending) return;
+        const progress = pending;
+        pending = null;
+        version.text = progress.text || version.text || '';
+        version.segments = Array.isArray(progress.segments) ? progress.segments : version.segments;
+        version.updatedAt = new Date().toISOString();
+        setLiveTranslation(recordKey, version);
+
+        const now = performance.now();
+        const completed = Number(progress.completed ?? 0);
+        const currentTotal = Number(progress.total ?? total ?? 0);
+        const statusText = currentTotal
+            ? `${channelName} 正在翻译 ${Math.min(completed, currentTotal)}/${currentTotal}...`
+            : `${channelName} 正在生成译文...`;
+
+        if (now - lastStatusAt > statusInterval) {
+            lastStatusAt = now;
+            updateMessageRecord(messageId, record => {
+                record.status = 'loading';
+                record.statusText = statusText;
+                record.selectedId = version.id;
+                record.visible = Boolean(localOptions.autoShow && !mutedLiveDisplays.has(recordKey));
+            }, recordKey);
+            const $modal = $(`#${MODAL_ID}`);
+            if ($modal.length && String($modal.data('message-id')) === String(messageId)) {
+                $('#stft_modal_status').text(statusText);
+            }
+        }
+
+        if (localOptions.autoShow && !mutedLiveDisplays.has(recordKey) && getMessageRecordKey(messageId) === recordKey) {
+            applyDisplay(messageId);
+        }
+    };
+
+    return progress => {
+        pending = progress;
+        const now = performance.now();
+        if (now - lastRenderAt >= renderInterval) {
+            lastRenderAt = now;
+            flush();
+        } else if (!frame) {
+            frame = requestAnimationFrame(() => {
+                lastRenderAt = performance.now();
+                flush();
+            });
+        }
+    };
 }
 
 function resolveTargetLanguage(localValue = null, customValue = null) {
@@ -1068,7 +1163,7 @@ async function requestViaTavernBackend(endpoint, body) {
     if (!baseEndpoint) throw new Error('请先在扩展设置里填写副 API / 反代地址。');
 
     const payload = {
-        stream: false,
+        stream: Boolean(body.stream),
         messages: body.messages,
         model: body.model,
         temperature: body.temperature,
@@ -1138,6 +1233,174 @@ async function requestDirectly(endpoint, body) {
     } catch (error) {
         throw new Error(directFetchErrorMessage(error, endpoint));
     }
+}
+
+function extractStreamingChunkText(data) {
+    const choice = data?.choices?.[0];
+    if (choice) {
+        return choice.delta?.content
+            ?? choice.message?.content
+            ?? choice.text
+            ?? '';
+    }
+    const parts = data?.candidates?.[0]?.content?.parts;
+    if (Array.isArray(parts)) {
+        return parts.map(part => part?.text || '').join('');
+    }
+    return data?.delta?.text ?? data?.content ?? data?.text ?? '';
+}
+
+async function readChatCompletionStream(response, onText) {
+    if (!response.ok) {
+        const raw = await response.text();
+        let data = null;
+        try {
+            data = raw ? JSON.parse(raw) : null;
+        } catch {
+            data = null;
+        }
+        const messageText = data?.error?.message || raw || response.statusText;
+        throw new Error(`API ${response.status}: ${compactHttpError(messageText, response.statusText)}`);
+    }
+    if (!response.body?.getReader) {
+        throw new Error('当前环境没有提供可读取的流式响应。');
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let rawBody = '';
+    let fullText = '';
+
+    const handleEvent = eventText => {
+        const dataLines = eventText
+            .split(/\r?\n/)
+            .filter(line => line.startsWith('data:'))
+            .map(line => line.slice(5).trim());
+        if (!dataLines.length) return false;
+
+        for (const rawData of dataLines) {
+            if (!rawData) continue;
+            if (rawData === '[DONE]') return true;
+            let data = null;
+            try {
+                data = JSON.parse(rawData);
+            } catch {
+                continue;
+            }
+            if (data?.error) {
+                throw new Error(data.error?.message || String(data.error));
+            }
+            const delta = extractStreamingChunkText(data);
+            if (delta) {
+                fullText += delta;
+                onText?.(fullText);
+            }
+        }
+        return false;
+    };
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        rawBody += chunk;
+        buffer += chunk;
+        const events = buffer.split(/\r?\n\r?\n/);
+        buffer = events.pop() || '';
+        for (const eventText of events) {
+            if (handleEvent(eventText)) return fullText;
+        }
+    }
+    if (buffer.trim()) handleEvent(buffer);
+    if (!fullText.trim() && rawBody.trim()) {
+        try {
+            const data = JSON.parse(rawBody);
+            fullText = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? extractStreamingChunkText(data) ?? '';
+            if (fullText) onText?.(fullText);
+        } catch {
+            if (!/^\s*(data:|\{|\[)/.test(rawBody)) {
+                fullText = rawBody.trim();
+                onText?.(fullText);
+            }
+        }
+    }
+    return fullText;
+}
+
+function decodeJsonStringLoose(value) {
+    const text = String(value ?? '');
+    try {
+        return JSON.parse(`"${text.replace(/"/g, '\\"')}"`);
+    } catch {
+        return text
+            .replace(/\\n/g, '\n')
+            .replace(/\\r/g, '\r')
+            .replace(/\\t/g, '\t')
+            .replace(/\\"/g, '"')
+            .replace(/\\\\/g, '\\');
+    }
+}
+
+function extractPartialTranslationValues(rawText) {
+    const value = stripJsonFence(rawText);
+    const results = [];
+    let cursor = 0;
+    const keyPattern = /"translation"\s*:\s*"/g;
+
+    while (cursor < value.length) {
+        keyPattern.lastIndex = cursor;
+        const match = keyPattern.exec(value);
+        if (!match) break;
+        let index = keyPattern.lastIndex;
+        let escaped = false;
+        let rawValue = '';
+        for (; index < value.length; index++) {
+            const char = value[index];
+            if (escaped) {
+                rawValue += `\\${char}`;
+                escaped = false;
+                continue;
+            }
+            if (char === '\\') {
+                escaped = true;
+                continue;
+            }
+            if (char === '"') break;
+            rawValue += char;
+        }
+        results.push(decodeJsonStringLoose(rawValue).trim());
+        cursor = index + 1;
+    }
+
+    return results.filter(Boolean);
+}
+
+function parsePartialTranslationProgress(rawText, sourceText, targetLanguage) {
+    const sourceSegments = getSourceSegments(sourceText);
+    const partialTranslations = extractPartialTranslationValues(rawText);
+    let segments;
+
+    if (partialTranslations.length) {
+        segments = sourceSegments.map((segment, index) => ({
+            ...segment,
+            translation: partialTranslations[index] || '',
+        }));
+    } else {
+        const text = String(rawText ?? '').trim();
+        const likelyJson = /^[\s`]*[\[{]/.test(text) || /"segments"|"translation"/.test(text);
+        segments = likelyJson
+            ? sourceSegments.map(segment => ({ ...segment, translation: '' }))
+            : alignSegmentsFromText(sourceText, text);
+    }
+
+    return {
+        text: segments.map(segment => segment.translation || '').filter(Boolean).join('\n\n').trim(),
+        segments,
+        raw: String(rawText ?? '').trim(),
+        usedFallback: !partialTranslations.length,
+        looksUntranslated: isProbablyUntranslated(segments, targetLanguage),
+    };
 }
 
 function getMachineSourceCode(channel) {
@@ -1310,18 +1573,18 @@ async function requestMachineTranslationText(sourceText, options, onProgress) {
     };
 }
 
-async function requestTranslationText(sourceText, options) {
+async function requestTranslationText(sourceText, options, onProgress) {
     const endpoint = normalizeEndpoint(settings.endpoint);
     if (!endpoint) throw new Error('请先在扩展设置里填写副 API / 反代地址。');
     if (!settings.model) throw new Error('请先填写翻译模型名。');
     const sourceSegments = getSourceSegments(sourceText);
 
-    const buildBody = (forceTranslate = false) => {
+    const buildBody = (forceTranslate = false, stream = false) => {
         const body = {
             model: settings.model,
             messages: buildMessages(sourceText, options.language, options.presetId, sourceSegments, forceTranslate),
             temperature: Number(settings.temperature) || 0,
-            stream: false,
+            stream,
         };
         const maxTokens = Number(settings.maxTokens);
         if (Number.isFinite(maxTokens) && maxTokens > 0) {
@@ -1360,6 +1623,47 @@ async function requestTranslationText(sourceText, options) {
         return parseTranslationResponse(translated, sourceText, options.language);
     };
 
+    const sendStreamAndParse = async (forceTranslate = false) => {
+        const body = buildBody(forceTranslate, true);
+        const response = settings.requestMode === requestModes.tavern
+            ? await requestViaTavernBackend(endpoint, body)
+            : await requestDirectly(endpoint, body);
+
+        let lastProgressText = '';
+        const rawText = await readChatCompletionStream(response, partialText => {
+            const parsed = parsePartialTranslationProgress(partialText, sourceText, options.language);
+            if (parsed.text && parsed.text !== lastProgressText) {
+                lastProgressText = parsed.text;
+                onProgress?.({
+                    ...parsed,
+                    completed: parsed.segments.filter(segment => String(segment.translation || '').trim()).length,
+                    total: sourceSegments.length,
+                    channel: translationChannels.ai,
+                });
+            }
+        });
+
+        if (!String(rawText).trim()) {
+            throw new Error('API 流式响应结束了，但没有拿到译文内容。');
+        }
+        return parseTranslationResponse(rawText, sourceText, options.language);
+    };
+
+    if (options.progressMode === progressModes.stream && typeof onProgress === 'function') {
+        let result = await sendStreamAndParse(false);
+        if (result.looksUntranslated || (result.missingTranslationCount && !result.usedFallback)) {
+            result = await sendAndParse(true);
+            result.retriedForCopy = true;
+        }
+        if (result.looksUntranslated) {
+            throw new Error('模型返回的译文仍然基本等于原文，已拦截保存。请确认目标语言，并把提示词预设改回内置预设后刷新翻译。');
+        }
+        if (result.missingTranslationCount && !result.usedFallback) {
+            throw new Error('API 返回内容里没有拿到有效 translation 字段，已拦截保存，避免把原文当译文显示。请点“刷新翻译”重试一次，或把提示词预设改回内置预设。');
+        }
+        return result;
+    }
+
     let result = await sendAndParse(false);
     if (result.looksUntranslated || result.missingTranslationCount) {
         result = await sendAndParse(true);
@@ -1374,9 +1678,9 @@ async function requestTranslationText(sourceText, options) {
     return result;
 }
 
-async function requestTranslation(messageId, options, sourceText = getMessageSourceText(messageId)) {
+async function requestTranslation(messageId, options, sourceText = getMessageSourceText(messageId), onProgress = null) {
     if (!sourceText) throw new Error('这个楼层没有可翻译正文。');
-    return requestTranslationText(sourceText, options);
+    return requestTranslationText(sourceText, options, onProgress);
 }
 
 async function translateMessage(messageId, options = {}) {
@@ -1393,6 +1697,9 @@ async function translateMessage(messageId, options = {}) {
         autoShow: options.autoShow ?? settings.autoShow,
         channel,
     };
+    localOptions.progressMode = channel === translationChannels.ai
+        ? (settings.aiProgressMode || progressModes.final)
+        : (settings.machineProgressMode || progressModes.stream);
 
     inFlight.set(recordKey, true);
     updateMessageRecord(messageId, record => {
@@ -1409,6 +1716,7 @@ async function translateMessage(messageId, options = {}) {
         if (channel !== translationChannels.ai) {
             const versionId = makeId('ver');
             const sourceSegments = getSourceSegments(sourceText);
+            const streamProgress = localOptions.progressMode === progressModes.stream;
             const version = {
                 id: versionId,
                 text: '',
@@ -1428,33 +1736,22 @@ async function translateMessage(messageId, options = {}) {
                 record.statusText = `正在使用${channelName}快速翻译 0/${sourceSegments.length}...`;
                 record.versions.push(version);
                 record.selectedId = version.id;
-                record.visible = Boolean(localOptions.autoShow);
+                record.visible = Boolean(localOptions.autoShow && streamProgress);
                 record.displayMode = localOptions.displayMode;
             }, recordKey);
 
-            if (localOptions.autoShow && getMessageRecordKey(messageId) === recordKey) applyDisplay(messageId);
-
-            const result = await requestMachineTranslationText(sourceText, localOptions, progress => {
-                const statusText = `${channelName} 已翻译 ${progress.completed}/${progress.total} 段...`;
-                updateMessageRecord(messageId, record => {
-                    const target = record.versions.find(item => item.id === versionId);
-                    if (target) {
-                        target.text = progress.text;
-                        target.segments = progress.segments;
-                    }
-                    record.status = 'loading';
-                    record.statusText = statusText;
-                    record.selectedId = versionId;
-                    record.visible = Boolean(localOptions.autoShow);
-                }, recordKey);
+            const progressRenderer = streamProgress
+                ? makeProgressRenderer(messageId, recordKey, version, localOptions, channelName, sourceSegments.length)
+                : null;
+            if (streamProgress) {
+                setLiveTranslation(recordKey, version);
                 if (localOptions.autoShow && getMessageRecordKey(messageId) === recordKey) applyDisplay(messageId);
-                const $modal = $(`#${MODAL_ID}`);
-                if ($modal.length && String($modal.data('message-id')) === String(messageId)) {
-                    $('#stft_modal_status').text(statusText);
-                }
-            });
+            }
+
+            const result = await requestMachineTranslationText(sourceText, localOptions, progressRenderer);
 
             if (result.looksUntranslated) {
+                clearLiveTranslation(recordKey);
                 updateMessageRecord(messageId, record => {
                     record.visible = false;
                     record.status = 'error';
@@ -1474,9 +1771,10 @@ async function translateMessage(messageId, options = {}) {
                 record.status = 'success';
                 record.statusText = `${channelName} 翻译完成。`;
                 record.selectedId = versionId;
-                record.visible = Boolean(localOptions.autoShow);
+                record.visible = Boolean(localOptions.autoShow && !mutedLiveDisplays.has(recordKey));
                 record.displayMode = localOptions.displayMode;
             }, recordKey);
+            clearLiveTranslation(recordKey);
 
             if (getMessageRecordKey(messageId) === recordKey) {
                 if (localOptions.autoShow) applyDisplay(messageId);
@@ -1489,13 +1787,13 @@ async function translateMessage(messageId, options = {}) {
             return;
         }
 
-        const result = await requestTranslation(messageId, localOptions, sourceText);
         const prompt = getPromptById(localOptions.presetId);
+        const streamProgress = localOptions.progressMode === progressModes.stream;
         const version = {
             id: makeId('ver'),
-            text: result.text,
-            segments: result.segments,
-            usedFallback: result.usedFallback,
+            text: '',
+            segments: getSourceSegments(sourceText).map(segment => ({ ...segment, translation: '' })),
+            usedFallback: false,
             language: localOptions.language,
             presetId: localOptions.presetId,
             presetName: prompt.name,
@@ -1503,6 +1801,26 @@ async function translateMessage(messageId, options = {}) {
             createdAt: new Date().toISOString(),
             sourceHash: hashText(sourceText),
         };
+        let progressRenderer = null;
+
+        if (streamProgress) {
+            updateMessageRecord(messageId, record => {
+                record.status = 'loading';
+                record.statusText = 'AI 副 API 正在流式生成译文...';
+                record.versions.push(version);
+                record.selectedId = version.id;
+                record.visible = Boolean(localOptions.autoShow);
+                record.displayMode = localOptions.displayMode;
+            }, recordKey);
+            setLiveTranslation(recordKey, version);
+            progressRenderer = makeProgressRenderer(messageId, recordKey, version, localOptions, channelName, version.segments.length);
+            if (localOptions.autoShow && getMessageRecordKey(messageId) === recordKey) applyDisplay(messageId);
+        }
+
+        const result = await requestTranslation(messageId, localOptions, sourceText, progressRenderer);
+        version.text = result.text;
+        version.segments = result.segments;
+        version.usedFallback = result.usedFallback;
 
         updateMessageRecord(messageId, record => {
             record.status = 'success';
@@ -1511,11 +1829,17 @@ async function translateMessage(messageId, options = {}) {
                 : result.usedFallback
                     ? '翻译完成，但模型没有按 JSON 返回，已按段落尽量匹配。'
                     : '翻译完成。';
-            record.versions.push(version);
+            const existing = record.versions.find(item => item.id === version.id);
+            if (existing) {
+                Object.assign(existing, version);
+            } else {
+                record.versions.push(version);
+            }
             record.selectedId = version.id;
-            record.visible = Boolean(localOptions.autoShow);
+            record.visible = Boolean(localOptions.autoShow && !mutedLiveDisplays.has(recordKey));
             record.displayMode = localOptions.displayMode;
         }, recordKey);
+        clearLiveTranslation(recordKey);
 
         if (getMessageRecordKey(messageId) === recordKey) {
             if (localOptions.autoShow) applyDisplay(messageId);
@@ -1526,6 +1850,7 @@ async function translateMessage(messageId, options = {}) {
         refreshModalIfOpen(messageId);
         toastr?.success?.('楼层翻译完成。');
     } catch (error) {
+        clearLiveTranslation(recordKey);
         updateMessageRecord(messageId, record => {
             record.status = 'error';
             record.statusText = error?.message || String(error);
@@ -1609,6 +1934,18 @@ function renderSettingsPanel() {
                                 <option value="${backendCompatModes.custom}"${settings.backendCompatMode === backendCompatModes.custom ? ' selected' : ''}>Custom OpenAI 格式</option>
                             </select>
                         </label>
+                        <label class="stft-ai-setting">AI 生成显示
+                            <select id="stft_ai_progress_mode" class="text_pole">
+                                <option value="${progressModes.stream}"${(settings.aiProgressMode || progressModes.stream) === progressModes.stream ? ' selected' : ''}>流式显示，边生成边替换</option>
+                                <option value="${progressModes.final}"${settings.aiProgressMode === progressModes.final ? ' selected' : ''}>完成后一次性显示</option>
+                            </select>
+                        </label>
+                        <label class="stft-machine-setting">机器翻译显示
+                            <select id="stft_machine_progress_mode" class="text_pole">
+                                <option value="${progressModes.stream}"${(settings.machineProgressMode || progressModes.stream) === progressModes.stream ? ' selected' : ''}>逐段显示，边翻译边替换</option>
+                                <option value="${progressModes.final}"${settings.machineProgressMode === progressModes.final ? ' selected' : ''}>完成后一次性显示</option>
+                            </select>
+                        </label>
                         <label id="stft_custom_header_label" class="stft-ai-setting">自定义请求头名
                             <input id="stft_custom_header" class="text_pole" value="${escapeHtml(settings.customAuthHeader)}">
                         </label>
@@ -1644,7 +1981,7 @@ function renderSettingsPanel() {
                         </label>
                         <label class="checkbox_label stft-span-2">
                             <input id="stft_auto_show" type="checkbox"${settings.autoShow ? ' checked' : ''}>
-                            翻译完成后自动显示
+                            自动显示译文（流式模式会边生成边显示）
                         </label>
                         <label class="checkbox_label stft-span-2">
                             <input id="stft_translate_users" type="checkbox"${settings.translateUserMessages ? ' checked' : ''}>
@@ -1706,6 +2043,8 @@ function bindSettingsPanel() {
         setAndSave('backendCompatMode', event.target.value);
         refreshConditionalSettings();
     });
+    $('#stft_ai_progress_mode').on('change', event => setAndSave('aiProgressMode', event.target.value));
+    $('#stft_machine_progress_mode').on('change', event => setAndSave('machineProgressMode', event.target.value));
     $('#stft_custom_header').on('input', event => setAndSave('customAuthHeader', event.target.value.trim()));
     $('#stft_microsoft_endpoint').on('input', event => setAndSave('microsoftEndpoint', event.target.value.trim()));
     $('#stft_microsoft_key').on('input', event => setAndSave('microsoftKey', event.target.value));
@@ -1746,7 +2085,9 @@ function refreshConditionalSettings() {
     const tavernMode = settings.requestMode === requestModes.tavern;
     const aiChannel = settings.translationChannel === translationChannels.ai;
     const microsoftChannel = settings.translationChannel === translationChannels.microsoft;
+    const machineChannel = settings.translationChannel !== translationChannels.ai;
     $('.stft-ai-setting').toggle(aiChannel);
+    $('.stft-machine-setting').toggle(machineChannel);
     $('.stft-backend-setting').toggle(aiChannel && tavernMode);
     $('.stft-microsoft-setting').toggle(microsoftChannel);
     $('#stft_custom_header_label').toggle(aiChannel && settings.authMode === authModes.custom && !simpleMode && (!tavernMode || settings.backendCompatMode === backendCompatModes.custom));
@@ -1754,11 +2095,13 @@ function refreshConditionalSettings() {
     $('#stft_auth_mode').closest('label').toggle(aiChannel && !simpleMode);
     $('#stft_custom_language_label').toggle(settings.targetLanguage === 'custom');
     if ($('#stft_global_status').length) {
+        const aiProgressText = (settings.aiProgressMode || progressModes.stream) === progressModes.stream ? '流式显示' : '完成后一次性显示';
+        const machineProgressText = (settings.machineProgressMode || progressModes.stream) === progressModes.stream ? '边返回边显示' : '完成后一次性显示';
         const statusText = aiChannel
-            ? '副 API 独立于酒馆主 API。推荐使用酒馆内置通道：不改酒馆本体，只调用酒馆已有生成接口。'
+            ? `副 API 独立于酒馆主 API。当前 AI 译文为${aiProgressText}；推荐使用酒馆内置通道，不改酒馆本体。`
             : microsoftChannel
-                ? 'Microsoft Translator 为快速机器翻译渠道，按段落并发请求，边返回边显示；需要填写 Key，区域资源再填写 Region。'
-                : 'Google 快速翻译为免密机器翻译渠道，按段落并发请求，边返回边显示；如果浏览器或网络拦截，会在楼层状态里报错。';
+                ? `Microsoft Translator 为快速机器翻译渠道，按段落并发请求，${machineProgressText}；需要填写 Key，区域资源再填写 Region。`
+                : `Google 快速翻译为免密机器翻译渠道，按段落并发请求，${machineProgressText}；如果浏览器或网络拦截，会在楼层状态里报错。`;
         const builtinMode = extension_settings.translate?.auto_mode;
         const guardText = settings.suppressBuiltinSwipeTranslate && builtinTranslateIncomingModes.has(builtinMode)
             ? ' 已拦截酒馆自带翻译的切换候选回复自动触发，避免未点击本扩展也出现 Google 红字。'
@@ -1889,7 +2232,7 @@ function buildFloorModal(messageId) {
                     </div>
                     <label class="checkbox_label">
                         <input id="stft_modal_auto_show" type="checkbox"${settings.autoShow ? ' checked' : ''}>
-                        本次翻译完成后自动显示
+                        本次翻译自动显示（流式模式会边生成边显示）
                     </label>
                     <div class="stft-row">
                         <div id="stft_modal_translate" class="menu_button">
@@ -2119,10 +2462,16 @@ function deleteVersion(messageId, versionId) {
 
 function toggleDisplay(messageId, fromModal = false) {
     const { record } = getMessageRecord(messageId);
-    const selected = getSelectedVersion(record);
-    if (!isDisplayableVersion(selected)) {
+    const recordKey = getMessageRecordKey(messageId);
+    const live = liveTranslations.get(recordKey);
+    const selected = live?.versionId === record.selectedId ? live.version : getSelectedVersion(record);
+    if (!isDisplayableVersion(selected) && !live) {
         openFloorModal(messageId);
         return;
+    }
+    if (live) {
+        if (record.visible) mutedLiveDisplays.add(recordKey);
+        else mutedLiveDisplays.delete(recordKey);
     }
     updateMessageRecord(messageId, nextRecord => {
         nextRecord.visible = !nextRecord.visible;
