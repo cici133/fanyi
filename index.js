@@ -537,8 +537,87 @@ function shouldTranslateHtmlTextNode(node) {
     return true;
 }
 
+function shouldTranslateRawHtmlText(value) {
+    const text = decodeHtmlEntities(value).trim();
+    if (!text) return false;
+    if (!/[\p{L}\p{N}]/u.test(text)) return false;
+    return true;
+}
+
+function getRawHtmlTagName(tagText) {
+    const match = String(tagText ?? '').match(/^<\s*\/?\s*([A-Za-z][\w:-]*)/);
+    return match ? match[1].toLowerCase() : '';
+}
+
+function isRawHtmlClosingTag(tagText) {
+    return /^<\s*\//.test(String(tagText ?? ''));
+}
+
+function isRawHtmlSelfClosingTag(tagText) {
+    const value = String(tagText ?? '');
+    if (/\/\s*>$/.test(value)) return true;
+    return /^<\s*(?:area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)\b/i.test(value);
+}
+
+function createRawHtmlBlockState(html) {
+    const source = String(html ?? '');
+    const ignoredTags = new Set(['script', 'style', 'code', 'pre', 'kbd', 'samp', 'textarea', 'svg', 'canvas', 'noscript']);
+    const textNodes = [];
+    const ignoreStack = [];
+    const tagRegex = /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<![^>]*>|<\/?[A-Za-z][\w:-]*(?:\s[^<>]*)?>/g;
+    let cursor = 0;
+    let match;
+
+    const addTextRange = (start, end) => {
+        if (ignoreStack.length || end <= start) return;
+        const raw = source.slice(start, end);
+        if (!shouldTranslateRawHtmlText(raw)) return;
+        const leading = raw.match(/^\s*/)?.[0] ?? '';
+        const trailing = raw.match(/\s*$/)?.[0] ?? '';
+        const coreRaw = raw.slice(leading.length, raw.length - trailing.length);
+        const decoded = decodeHtmlEntities(coreRaw).trim();
+        if (!decoded) return;
+        textNodes.push({
+            start,
+            end,
+            source: decoded,
+            leading,
+            trailing,
+            coreRaw,
+            replacement: null,
+        });
+    };
+
+    while ((match = tagRegex.exec(source))) {
+        addTextRange(cursor, match.index);
+        const tagText = match[0];
+        const tagName = getRawHtmlTagName(tagText);
+        if (tagName && ignoredTags.has(tagName)) {
+            if (isRawHtmlClosingTag(tagText)) {
+                const index = ignoreStack.lastIndexOf(tagName);
+                if (index !== -1) ignoreStack.splice(index, 1);
+            } else if (!isRawHtmlSelfClosingTag(tagText)) {
+                ignoreStack.push(tagName);
+            }
+        }
+        cursor = match.index + tagText.length;
+    }
+
+    addTextRange(cursor, source.length);
+    if (!textNodes.length) return null;
+    return {
+        source,
+        isFullDocument: looksLikeStandaloneHtml(source),
+        raw: true,
+        textNodes,
+    };
+}
+
 function createHtmlBlockState(html) {
     const source = String(html ?? '');
+    const rawState = createRawHtmlBlockState(source);
+    if (rawState) return rawState;
+
     const isFullDocument = looksLikeStandaloneHtml(source);
     const state = {
         source,
@@ -588,6 +667,17 @@ function createHtmlBlockState(html) {
 
 function serializeHtmlBlockState(state) {
     if (!state) return '';
+    if (state.raw) {
+        let output = '';
+        let cursor = 0;
+        for (const textNode of state.textNodes) {
+            output += state.source.slice(cursor, textNode.start);
+            output += textNode.replacement ?? state.source.slice(textNode.start, textNode.end);
+            cursor = textNode.end;
+        }
+        output += state.source.slice(cursor);
+        return output;
+    }
     if (state.isFullDocument && state.document) {
         const doctype = state.document.doctype
             ? `<!DOCTYPE ${state.document.doctype.name}>`
@@ -665,7 +755,14 @@ function applyHtmlTranslationPlan(plan, translatedSegments = []) {
     for (const block of plan.blocks) {
         for (const textNode of block.state.textNodes) {
             const translation = translations.get(Number(textNode.segmentId));
-            textNode.node.nodeValue = `${textNode.leading}${translation || textNode.source}${textNode.trailing}`;
+            const translated = String(translation || '').trim();
+            if (textNode.node) {
+                textNode.node.nodeValue = `${textNode.leading}${translated || textNode.source}${textNode.trailing}`;
+            } else {
+                textNode.replacement = translated
+                    ? `${textNode.leading}${escapeHtml(translated)}${textNode.trailing}`
+                    : `${textNode.leading}${textNode.coreRaw ?? textNode.source}${textNode.trailing}`;
+            }
         }
     }
 
@@ -705,6 +802,11 @@ function makeHtmlTranslationResult(plan, translatedSegments, targetLanguage, raw
         missingTranslationCount,
         htmlMode: true,
     };
+}
+
+function assertHtmlTextExtraction(sourceText, htmlPlan) {
+    if (htmlPlan || !looksLikeHtmlDocumentSource(sourceText)) return;
+    throw new Error('检测到 HTML 美化代码块，但没有成功提取可翻译文本。已停止整段翻译，避免把 HTML/CSS/JS 标签翻坏。');
 }
 
 function alignSegmentsFromText(originalText, translatedText) {
@@ -875,7 +977,16 @@ function renderOriginalHtmlDocument(messageId) {
     return renderMarkdown(getMessageData(messageId)?.mes || '', messageId);
 }
 
-function getHtmlDocumentVersionText(version) {
+function getHtmlDocumentVersionText(version, originalText = '') {
+    const htmlSegments = getHtmlVersionSegments(version);
+    if (htmlSegments.length) {
+        const plan = createHtmlTranslationPlan(originalText);
+        if (plan) {
+            const rebuilt = applyHtmlTranslationPlan(plan, htmlSegments);
+            if (String(rebuilt ?? '').trim()) return rebuilt;
+        }
+    }
+
     const text = String(version?.text ?? '').trim();
     if (text) return version.text;
     const documentSegment = version?.segments?.find(segment => segment.kind === 'html_document');
@@ -885,7 +996,7 @@ function getHtmlDocumentVersionText(version) {
 }
 
 function renderHtmlDocumentVersion(messageId, version) {
-    const translatedHtmlText = getHtmlDocumentVersionText(version);
+    const translatedHtmlText = getHtmlDocumentVersionText(version, getMessageData(messageId)?.mes || '');
     if (translatedHtmlText) {
         return renderMarkdown(translatedHtmlText, messageId);
     }
@@ -932,6 +1043,16 @@ function getReplaceText(originalText, version) {
     return String(version?.text ?? '').trim();
 }
 
+function buildHtmlNativeDisplayText(originalText, version, mode) {
+    const translatedText = String(getHtmlDocumentVersionText(version, originalText) || '').trim();
+    if (!translatedText) return '';
+    if (mode === displayModes.replace) return translatedText;
+
+    const sourceText = String(originalText ?? '').trim();
+    if (!sourceText) return translatedText;
+    return `${sourceText}\n\n---\n\n${translatedText}`;
+}
+
 function renderReplaceHtml(originalText, version, messageId) {
     if (isHtmlDocumentVersion(version)) {
         return `<div class="stft-render stft-replace-render stft-html-document-render">${renderInlineToggleButton(messageId, true)}${renderHtmlDocumentVersion(messageId, version)}</div>`;
@@ -963,9 +1084,104 @@ function emitNativeMessageRendered(messageId) {
     if (!message) return;
     const eventName = message.is_user ? event_types.USER_MESSAGE_RENDERED : event_types.CHARACTER_MESSAGE_RENDERED;
     try {
-        void eventSource.emit(eventName, Number(messageId));
+        void eventSource.emit(eventName, Number(messageId), 'floor_translator');
+        void eventSource.emit(event_types.MESSAGE_UPDATED, Number(messageId));
     } catch (error) {
         console.warn('[Floor Translator] message rendered event failed', error);
+    }
+}
+
+function scheduleNativeMessageRendered(messageId) {
+    emitNativeMessageRendered(messageId);
+    setTimeout(() => emitNativeMessageRendered(messageId), 80);
+    setTimeout(() => emitNativeMessageRendered(messageId), 260);
+}
+
+function looksLikeFrontendHtmlCode(value) {
+    const text = String(value ?? '');
+    return /^<!doctype\s+html/i.test(text.trim())
+        || /<html[\s>]/i.test(text)
+        || /<head[\s>]/i.test(text)
+        || /<body[\s>]/i.test(text);
+}
+
+function resizeFallbackIframe(iframe) {
+    try {
+        const doc = iframe.contentDocument;
+        if (!doc) return;
+        const height = Math.max(
+            doc.body?.scrollHeight || 0,
+            doc.documentElement?.scrollHeight || 0,
+            160,
+        );
+        iframe.style.height = `${Math.min(height + 16, 6000)}px`;
+    } catch {
+        iframe.style.height = '70vh';
+    }
+}
+
+function mountFallbackFrontendIframe(pre, code) {
+    const $pre = $(pre);
+    if ($pre.closest('.TH-render').length || $pre.closest('.stft-fallback-render').length) return;
+
+    const iframe = document.createElement('iframe');
+    iframe.className = 'stft-fallback-iframe';
+    iframe.setAttribute('loading', 'lazy');
+    iframe.setAttribute('referrerpolicy', 'no-referrer');
+    iframe.srcdoc = String(code ?? '');
+    iframe.addEventListener('load', () => {
+        resizeFallbackIframe(iframe);
+        setTimeout(() => resizeFallbackIframe(iframe), 120);
+        setTimeout(() => resizeFallbackIframe(iframe), 600);
+        try {
+            const doc = iframe.contentDocument;
+            if (doc && typeof ResizeObserver !== 'undefined') {
+                const observer = new ResizeObserver(() => resizeFallbackIframe(iframe));
+                observer.observe(doc.documentElement);
+                if (doc.body) observer.observe(doc.body);
+            }
+        } catch {
+            // Cross-document sizing can fail on unusual mobile WebViews.
+        }
+    });
+
+    $pre.wrap('<div class="stft-fallback-render"></div>');
+    $pre.addClass('stft-fallback-source').hide();
+    $pre.parent().append(iframe);
+}
+
+function renderFallbackFrontendCodeBlocks(messageId) {
+    const $text = getMessageElement(messageId).find('.mes_text').first();
+    if (!$text.length) return;
+    $text.find('pre').each((_index, pre) => {
+        const $pre = $(pre);
+        if ($pre.closest('.TH-render').length || $pre.closest('.stft-fallback-render').length) return;
+        const code = $pre.text();
+        if (!looksLikeFrontendHtmlCode(code)) return;
+        mountFallbackFrontendIframe(pre, code);
+    });
+}
+
+function withTemporaryDisplayText(message, displayText, callback) {
+    if (!message) return callback();
+    const hadExtra = Object.prototype.hasOwnProperty.call(message, 'extra') && message.extra && typeof message.extra === 'object';
+    const extra = hadExtra ? message.extra : {};
+    const hadDisplayText = Object.prototype.hasOwnProperty.call(extra, 'display_text');
+    const previousDisplayText = extra.display_text;
+
+    message.extra = extra;
+    extra.display_text = displayText;
+    try {
+        return callback();
+    } finally {
+        if (hadDisplayText) {
+            extra.display_text = previousDisplayText;
+        } else {
+            delete extra.display_text;
+        }
+        if (!hadExtra && !Object.keys(extra).length) {
+            delete message.extra;
+        }
     }
 }
 
@@ -975,10 +1191,25 @@ function rerenderNativeMessage(messageId) {
     try {
         updateMessageBlock(Number(messageId), message);
         clearOriginalRenderCache(messageId);
-        emitNativeMessageRendered(messageId);
+        scheduleNativeMessageRendered(messageId);
         return true;
     } catch (error) {
         console.warn('[Floor Translator] native message render failed', error);
+        return false;
+    }
+}
+
+function rerenderNativeMessageWithDisplayText(messageId, displayText) {
+    const message = getMessageData(messageId);
+    if (!message) return false;
+    try {
+        withTemporaryDisplayText(message, displayText, () => {
+            updateMessageBlock(Number(messageId), message);
+        });
+        scheduleNativeMessageRendered(messageId);
+        return true;
+    } catch (error) {
+        console.warn('[Floor Translator] native translated render failed', error);
         return false;
     }
 }
@@ -1005,6 +1236,28 @@ function restoreNativeMessageDisplay(messageId, hasTranslation, renderKey) {
     setTimeout(addToggle, 0);
     setTimeout(addToggle, 160);
     setTimeout(addToggle, 500);
+    if (hasTranslation) {
+        setTimeout(() => renderFallbackFrontendCodeBlocks(messageId), 620);
+        setTimeout(() => renderFallbackFrontendCodeBlocks(messageId), 1200);
+    }
+    return true;
+}
+
+function applyNativeHtmlDocumentDisplay(messageId, displayText, hasTranslation, visible, renderKey) {
+    if (!String(displayText ?? '').trim()) return false;
+    if (!rerenderNativeMessageWithDisplayText(messageId, displayText)) return false;
+
+    const addToggle = () => {
+        const $freshText = getMessageElement(messageId).find('.mes_text').first();
+        if (!$freshText.length) return;
+        prependInlineToggleIfNeeded(messageId, $freshText, hasTranslation, visible);
+        $freshText.attr('data-stft-render-key', renderKey);
+    };
+    setTimeout(addToggle, 0);
+    setTimeout(addToggle, 180);
+    setTimeout(addToggle, 560);
+    setTimeout(() => renderFallbackFrontendCodeBlocks(messageId), 680);
+    setTimeout(() => renderFallbackFrontendCodeBlocks(messageId), 1300);
     return true;
 }
 
@@ -1040,6 +1293,14 @@ function applyDisplay(messageId) {
         updateButtonState($mes);
         return;
     }
+    if (htmlVersion) {
+        const nativeDisplayText = buildHtmlNativeDisplayText(message.mes, version, mode);
+        if (applyNativeHtmlDocumentDisplay(messageId, nativeDisplayText, true, true, renderKey)) {
+            updateButtonState($mes);
+            return;
+        }
+    }
+
     rememberOriginalRender(messageId, $text);
     const html = mode === displayModes.replace
         ? renderReplaceHtml(message.mes, version, messageId)
@@ -1545,7 +1806,7 @@ function parseTranslationResponse(rawText, sourceText, targetLanguage, sourceSeg
         ? jsonSegments
         : sourceSegments.map((segment, index) => ({
             ...segment,
-            translation: splitParagraphs(rawText)[index] || '',
+            translation: htmlPlan ? '' : (splitParagraphs(rawText)[index] || ''),
         }));
     if (htmlPlan) {
         return makeHtmlTranslationResult(htmlPlan, segments, targetLanguage, rawText, !jsonSegments?.length);
@@ -1850,7 +2111,7 @@ function parsePartialTranslationProgress(rawText, sourceText, targetLanguage, so
         segments = likelyJson
             ? sourceSegments.map(segment => ({ ...segment, translation: '' }))
             : htmlPlan
-                ? sourceSegments.map((segment, index) => ({ ...segment, translation: splitParagraphs(text)[index] || '' }))
+                ? sourceSegments.map(segment => ({ ...segment, translation: '' }))
                 : alignSegmentsFromText(sourceText, text);
     }
 
@@ -1997,6 +2258,7 @@ async function translateWithMicrosoft(text, targetLanguage) {
 async function requestMachineTranslationText(sourceText, options, onProgress) {
     const channel = options.channel || settings.translationChannel;
     const htmlPlan = createHtmlTranslationPlan(sourceText);
+    assertHtmlTextExtraction(sourceText, htmlPlan);
     const sourceSegments = htmlPlan?.segments || getSourceSegments(sourceText);
     const resultSegments = sourceSegments.map(segment => ({
         id: segment.id,
@@ -2063,6 +2325,7 @@ async function requestTranslationText(sourceText, options, onProgress) {
     if (!endpoint) throw new Error('请先在扩展设置里填写副 API / 反代地址。');
     if (!settings.model) throw new Error('请先填写翻译模型名。');
     const htmlPlan = createHtmlTranslationPlan(sourceText);
+    assertHtmlTextExtraction(sourceText, htmlPlan);
     const sourceSegments = htmlPlan?.segments || getSourceSegments(sourceText);
 
     const buildBody = (forceTranslate = false, stream = false) => {
@@ -2187,6 +2450,7 @@ async function translateMessage(messageId, options = {}) {
         ? (settings.aiProgressMode || progressModes.final)
         : (settings.machineProgressMode || progressModes.stream);
     const htmlPlanForInitial = createHtmlTranslationPlan(sourceText);
+    assertHtmlTextExtraction(sourceText, htmlPlanForInitial);
     const sourceSegmentsForTranslation = htmlPlanForInitial?.segments || getSourceSegments(sourceText);
     const initialVersionSegments = htmlPlanForInitial
         ? makeHtmlTranslationResult(
