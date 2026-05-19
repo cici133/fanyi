@@ -2008,9 +2008,15 @@ function startEditVersion($version) {
     if (!version) return;
 
     $version.addClass('stft-version-editing');
+    $version.find('.stft-version-head .stft-row').first()
+        .addClass('stft-version-edit-actions stft-version-edit-actions-top')
+        .html(`
+            <div class="menu_button menu_button_icon fa-solid fa-check" data-stft-save title="保存"></div>
+            <div class="menu_button menu_button_icon fa-solid fa-xmark" data-stft-cancel title="取消"></div>
+        `);
     $version.find('.stft-version-preview').replaceWith(`
         <textarea class="text_pole stft-version-editor" spellcheck="false">${escapeHtml(version.text)}</textarea>
-        <div class="stft-row marginTop5 stft-version-edit-actions">
+        <div class="stft-row marginTop5 stft-version-edit-actions stft-version-edit-actions-bottom">
             <div class="menu_button menu_button_icon fa-solid fa-check" data-stft-save title="保存"></div>
             <div class="menu_button menu_button_icon fa-solid fa-xmark" data-stft-cancel title="取消"></div>
         </div>`);
@@ -2020,12 +2026,6 @@ function startEditVersion($version) {
     });
     requestAnimationFrame(() => {
         $version[0]?.scrollIntoView?.({ block: 'center', behavior: 'smooth' });
-        const editor = $version.find('.stft-version-editor')[0];
-        try {
-            editor?.focus?.({ preventScroll: true });
-        } catch {
-            editor?.focus?.();
-        }
     });
 
     $version.find('[data-stft-save]').on('click', event => {

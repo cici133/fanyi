@@ -170,7 +170,8 @@
     flex-direction: column;
     gap: 12px;
     overflow: auto;
-    overscroll-behavior: contain;
+    overscroll-behavior: auto;
+    padding-bottom: 16px;
     padding-right: 2px;
 }
 
@@ -217,22 +218,31 @@
 
 #stft_modal .stft-version-editor {
     box-sizing: border-box;
-    height: min(46dvh, 520px);
+    height: clamp(180px, 32dvh, 360px);
     line-height: 1.5;
     margin-top: 8px;
-    min-height: min(34dvh, 320px);
-    overscroll-behavior: contain;
+    min-height: 180px;
+    overscroll-behavior: auto;
     resize: vertical;
     touch-action: pan-y;
     width: 100%;
 }
 
 #stft_modal .stft-version-edit-actions {
+    align-items: center;
     background: var(--SmartThemeBlurTintColor, #1f1f1f);
+    z-index: 1;
+}
+
+#stft_modal .stft-version-edit-actions-top {
+    border-radius: 6px;
+    padding: 2px;
+}
+
+#stft_modal .stft-version-edit-actions-bottom {
     bottom: 0;
     padding-top: 8px;
     position: sticky;
-    z-index: 1;
 }
 
 #stft_modal .stft-empty {
