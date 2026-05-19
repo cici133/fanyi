@@ -191,6 +191,7 @@ const defaultSettings = {
 
 let settings = {};
 let scanTimer = 0;
+let scanNeedsPrune = false;
 let observer = null;
 const inFlight = new Map();
 
@@ -589,10 +590,10 @@ function restoreDisplay(messageId, updateRecord = true) {
     updateButtonState($mes);
 }
 
-function updateButtonState($mes) {
+function updateButtonState($mes, store = null) {
     if (!$mes?.length) return;
     const messageId = String($mes.attr('mesid'));
-    const store = loadStore();
+    if (!store) store = loadStore();
     const recordKey = getMessageRecordKey(messageId);
     const record = store.messages[recordKey];
     const hasTranslation = hasDisplayableVersion(record);
@@ -611,16 +612,21 @@ function updateButtonState($mes) {
         .attr('title', title);
 }
 
-function queueScan() {
+function queueScan(options = {}) {
+    scanNeedsPrune = scanNeedsPrune || Boolean(options.prune);
     clearTimeout(scanTimer);
     scanTimer = setTimeout(() => {
-        pruneMissingRecords();
-        ensureMessageButtons();
-        reapplyVisibleDisplays();
+        if (scanNeedsPrune) {
+            pruneMissingRecords();
+        }
+        scanNeedsPrune = false;
+        const store = loadStore();
+        ensureMessageButtons(store);
+        reapplyVisibleDisplays(store);
     }, 80);
 }
 
-function ensureMessageButtons() {
+function ensureMessageButtons(store = loadStore()) {
     $('#chat .mes').each((_, element) => {
         const $mes = $(element);
         $mes.find(`.${LEGACY_TOGGLE_CLASS}, .${LEGACY_PANEL_CLASS}`).remove();
@@ -634,22 +640,32 @@ function ensureMessageButtons() {
         if (!$buttons.find(`.${BUTTON_CLASS}`).length) {
             $buttons.append(`<div title="楼层翻译" class="mes_button ${BUTTON_CLASS} fa-solid fa-language"></div>`);
         }
-        updateButtonState($mes);
+        updateButtonState($mes, store);
     });
 }
 
-function reapplyVisibleDisplays() {
+function ensureHiddenInlineToggle($mes, messageId) {
+    const $text = $mes.find('.mes_text').first();
+    if (!$text.length || $text.children(`.${INLINE_TOGGLE_CLASS}`).first().length) return;
+    $text.prepend(renderInlineToggleButton(messageId, false));
+}
+
+function reapplyVisibleDisplays(store = loadStore()) {
     $('#chat .mes').each((_, element) => {
         const $mes = $(element);
         const messageId = String($mes.attr('mesid'));
-        const record = loadStore().messages[getMessageRecordKey(messageId)];
+        const record = store.messages[getMessageRecordKey(messageId)];
         if (record?.visible && getSelectedVersion(record)) {
             applyDisplay(messageId);
         } else {
-            if (hasDisplayableVersion(record) || $mes.find(`.mes_text .stft-render, .mes_text .${INLINE_TOGGLE_CLASS}`).length) {
+            const hasPluginRender = Boolean($mes.find('.mes_text .stft-render').length);
+            const hasInlineToggle = Boolean($mes.find(`.mes_text .${INLINE_TOGGLE_CLASS}`).length);
+            if (hasPluginRender || (!hasDisplayableVersion(record) && hasInlineToggle)) {
                 restoreDisplay(messageId, false);
+            } else if (hasDisplayableVersion(record) && !hasInlineToggle) {
+                ensureHiddenInlineToggle($mes, messageId);
             }
-            updateButtonState($mes);
+            updateButtonState($mes, store);
         }
     });
 }
@@ -1988,7 +2004,6 @@ function bindMessageButtons() {
 
 function bindEvents() {
     const eventsToScan = [
-        event_types.CHAT_CHANGED,
         event_types.CHARACTER_MESSAGE_RENDERED,
         event_types.USER_MESSAGE_RENDERED,
         event_types.GENERATION_ENDED,
@@ -1997,6 +2012,7 @@ function bindEvents() {
     for (const eventName of eventsToScan) {
         eventSource.on(eventName, () => queueScan());
     }
+    eventSource.on(event_types.CHAT_CHANGED, () => queueScan({ prune: true }));
     eventSource.on(event_types.MESSAGE_UPDATED, payload => {
         const messageId = getEventMessageId(payload);
         queueScan();
@@ -2009,13 +2025,11 @@ function bindEvents() {
     });
     eventSource.on(event_types.MESSAGE_SWIPE_DELETED, payload => {
         const messageId = getEventMessageId(payload);
-        pruneMissingRecords();
-        queueScan();
+        queueScan({ prune: true });
         refreshModalIfOpen(messageId);
     });
     eventSource.on(event_types.MESSAGE_DELETED, () => {
-        pruneMissingRecords();
-        queueScan();
+        queueScan({ prune: true });
         const modalMessageId = $(`#${MODAL_ID}`).data('message-id');
         if (modalMessageId !== undefined && !getMessageData(modalMessageId)) {
             closeFloorModal();
@@ -2027,7 +2041,7 @@ function startObserver() {
     const chat = document.querySelector('#chat');
     if (!chat) return;
     observer = new MutationObserver(queueScan);
-    observer.observe(chat, { childList: true, subtree: true });
+    observer.observe(chat, { childList: true });
 }
 
 async function init() {
@@ -2037,9 +2051,11 @@ async function init() {
         renderSettingsPanel();
         bindMessageButtons();
         bindEvents();
-        ensureMessageButtons();
+        pruneMissingRecords();
+        const store = loadStore();
+        ensureMessageButtons(store);
         startObserver();
-        reapplyVisibleDisplays();
+        reapplyVisibleDisplays(store);
         console.info('[Floor Translator] loaded');
     } catch (error) {
         console.error('[Floor Translator] init failed', error);
