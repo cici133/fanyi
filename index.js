@@ -30,6 +30,11 @@ const requestModes = {
     simple: 'simple',
 };
 
+const backendCompatModes = {
+    openaiProxy: 'openai-proxy',
+    custom: 'custom',
+};
+
 const translationChannels = {
     ai: 'ai',
     google: 'google',
@@ -173,6 +178,7 @@ const defaultSettings = {
     authMode: authModes.bearer,
     customAuthHeader: 'Authorization',
     requestMode: requestModes.tavern,
+    backendCompatMode: backendCompatModes.openaiProxy,
     microsoftKey: '',
     microsoftRegion: '',
     microsoftEndpoint: 'https://api.cognitive.microsofttranslator.com',
@@ -1065,12 +1071,19 @@ async function requestViaTavernBackend(endpoint, body) {
         stream: false,
         messages: body.messages,
         model: body.model,
-        chat_completion_source: 'custom',
-        custom_url: baseEndpoint,
-        custom_include_headers: buildTavernBackendHeaders(),
         temperature: body.temperature,
         max_tokens: body.max_tokens,
     };
+    const backendCompatMode = settings.backendCompatMode || backendCompatModes.openaiProxy;
+    if (backendCompatMode === backendCompatModes.custom) {
+        payload.chat_completion_source = 'custom';
+        payload.custom_url = baseEndpoint;
+        payload.custom_include_headers = buildTavernBackendHeaders();
+    } else {
+        payload.chat_completion_source = 'openai';
+        payload.reverse_proxy = baseEndpoint;
+        payload.proxy_password = settings.authMode === authModes.none ? '' : String(settings.apiKey || '').trim();
+    }
 
     Object.keys(payload).forEach(key => {
         if (payload[key] === undefined) {
@@ -1351,7 +1364,7 @@ async function requestTranslationText(sourceText, options) {
     if (result.looksUntranslated || result.missingTranslationCount) {
         result = await sendAndParse(true);
         result.retriedForCopy = true;
-        if (result.missingTranslationCount) {
+        if (result.missingTranslationCount && !result.usedFallback) {
             throw new Error('API 返回内容里没有拿到有效 translation 字段，已拦截保存，避免把原文当译文显示。请点“刷新翻译”重试一次，或把提示词预设改回内置预设。');
         }
         if (result.looksUntranslated) {
@@ -1590,6 +1603,12 @@ function renderSettingsPanel() {
                                 <option value="${requestModes.simple}"${settings.requestMode === requestModes.simple ? ' selected' : ''}>前端直连：兼容模式</option>
                             </select>
                         </label>
+                        <label class="stft-ai-setting stft-backend-setting">后端兼容方式
+                            <select id="stft_backend_compat_mode" class="text_pole">
+                                <option value="${backendCompatModes.openaiProxy}"${(settings.backendCompatMode || backendCompatModes.openaiProxy) === backendCompatModes.openaiProxy ? ' selected' : ''}>OpenAI 反代格式（推荐）</option>
+                                <option value="${backendCompatModes.custom}"${settings.backendCompatMode === backendCompatModes.custom ? ' selected' : ''}>Custom OpenAI 格式</option>
+                            </select>
+                        </label>
                         <label id="stft_custom_header_label" class="stft-ai-setting">自定义请求头名
                             <input id="stft_custom_header" class="text_pole" value="${escapeHtml(settings.customAuthHeader)}">
                         </label>
@@ -1683,6 +1702,10 @@ function bindSettingsPanel() {
         setAndSave('requestMode', event.target.value);
         refreshConditionalSettings();
     });
+    $('#stft_backend_compat_mode').on('change', event => {
+        setAndSave('backendCompatMode', event.target.value);
+        refreshConditionalSettings();
+    });
     $('#stft_custom_header').on('input', event => setAndSave('customAuthHeader', event.target.value.trim()));
     $('#stft_microsoft_endpoint').on('input', event => setAndSave('microsoftEndpoint', event.target.value.trim()));
     $('#stft_microsoft_key').on('input', event => setAndSave('microsoftKey', event.target.value));
@@ -1720,11 +1743,13 @@ function bindSettingsPanel() {
 
 function refreshConditionalSettings() {
     const simpleMode = settings.requestMode === requestModes.simple;
+    const tavernMode = settings.requestMode === requestModes.tavern;
     const aiChannel = settings.translationChannel === translationChannels.ai;
     const microsoftChannel = settings.translationChannel === translationChannels.microsoft;
     $('.stft-ai-setting').toggle(aiChannel);
+    $('.stft-backend-setting').toggle(aiChannel && tavernMode);
     $('.stft-microsoft-setting').toggle(microsoftChannel);
-    $('#stft_custom_header_label').toggle(aiChannel && settings.authMode === authModes.custom && !simpleMode);
+    $('#stft_custom_header_label').toggle(aiChannel && settings.authMode === authModes.custom && !simpleMode && (!tavernMode || settings.backendCompatMode === backendCompatModes.custom));
     $('#stft_api_key').closest('label').toggle(aiChannel && !simpleMode);
     $('#stft_auth_mode').closest('label').toggle(aiChannel && !simpleMode);
     $('#stft_custom_language_label').toggle(settings.targetLanguage === 'custom');
