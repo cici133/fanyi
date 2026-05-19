@@ -1892,19 +1892,25 @@ function renderVersionList(messageId, record, message) {
     return record.versions.slice().reverse().map(version => {
         const selected = version.id === record.selectedId;
         const sourceChanged = version.sourceHash && message && version.sourceHash !== hashText(message.mes || '');
+        const previewLimit = 900;
+        const fullText = String(version.text ?? '');
+        const previewText = fullText.length > previewLimit
+            ? `${fullText.slice(0, previewLimit)}\n\n...（仅预览前 ${previewLimit} 字，编辑时加载完整译文）`
+            : fullText;
+        const textLength = fullText.length ? ` · ${fullText.length.toLocaleString()} 字` : '';
         return `
             <div class="stft-version${selected ? ' stft-selected' : ''}" data-version-id="${escapeHtml(version.id)}">
                 <div class="stft-version-head">
                     <div>
                         <b>${escapeHtml(version.presetName || '译文')}</b>
-                        <div class="stft-version-meta">${escapeHtml(formatDate(version.createdAt))} · ${escapeHtml(version.language || '')}${sourceChanged ? ' · 原文已变化' : ''}</div>
+                        <div class="stft-version-meta">${escapeHtml(formatDate(version.createdAt))} · ${escapeHtml(version.language || '')}${escapeHtml(textLength)}${sourceChanged ? ' · 原文已变化' : ''}</div>
                     </div>
                     <div class="stft-row">
                         <div class="menu_button menu_button_icon fa-solid fa-pencil" data-stft-edit title="编辑"></div>
                         <div class="menu_button menu_button_icon fa-solid fa-trash-can" data-stft-delete title="删除"></div>
                     </div>
                 </div>
-                <div class="stft-version-preview">${escapeHtml(version.text).slice(0, 700)}</div>
+                <div class="stft-version-preview">${escapeHtml(previewText)}</div>
             </div>`;
     }).join('');
 }

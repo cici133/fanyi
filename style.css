@@ -148,6 +148,7 @@
     gap: 12px;
     max-height: min(92dvh, 860px);
     max-width: min(96vw, 900px);
+    min-height: 0;
     overflow: hidden;
     padding: 16px;
     width: 100%;
@@ -169,10 +170,13 @@
     display: flex;
     flex-direction: column;
     gap: 12px;
+    min-height: 0;
     overflow: auto;
     overscroll-behavior: auto;
-    padding-bottom: 56px;
+    padding-bottom: max(96px, calc(56px + env(safe-area-inset-bottom)));
     padding-right: 2px;
+    scroll-padding-bottom: max(96px, calc(56px + env(safe-area-inset-bottom)));
+    -webkit-overflow-scrolling: touch;
 }
 
 #stft_modal .stft-floating-edit-actions {
@@ -199,6 +203,7 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
+    padding-bottom: max(72px, env(safe-area-inset-bottom));
 }
 
 #stft_modal .stft-version {
@@ -206,6 +211,11 @@
     border-radius: 8px;
     cursor: pointer;
     padding: 10px;
+}
+
+#stft_modal .stft-version:not(.stft-version-editing) {
+    contain-intrinsic-size: 160px;
+    content-visibility: auto;
 }
 
 #stft_modal .stft-version-editing {
@@ -230,6 +240,7 @@
 }
 
 #stft_modal .stft-version-preview {
+    contain: content;
     margin-top: 8px;
     max-height: 8.5em;
     overflow: hidden;
@@ -260,9 +271,7 @@
 }
 
 #stft_modal .stft-version-edit-actions-bottom {
-    bottom: 0;
     padding-top: 8px;
-    position: sticky;
 }
 
 #stft_modal .stft-empty {
