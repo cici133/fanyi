@@ -192,6 +192,9 @@ const defaultSettings = {
 let settings = {};
 let scanTimer = 0;
 let scanNeedsPrune = false;
+let scanNeedsFull = false;
+const pendingScanMessageIds = new Set();
+let fullScanToken = 0;
 let observer = null;
 const inFlight = new Map();
 
@@ -229,10 +232,12 @@ function installBuiltinSwipeTranslateGuard() {
 
     const originalEmit = eventSource.emit.bind(eventSource);
     eventSource.emit = async function guardedEmit(eventName, ...args) {
+        if (eventName !== event_types.MESSAGE_SWIPED) {
+            return originalEmit(eventName, ...args);
+        }
         const translateSettings = extension_settings.translate;
         const originalAutoMode = translateSettings?.auto_mode;
-        const shouldMute = eventName === event_types.MESSAGE_SWIPED
-            && shouldSuppressBuiltinSwipeTranslate()
+        const shouldMute = shouldSuppressBuiltinSwipeTranslate()
             && builtinTranslateIncomingModes.has(originalAutoMode);
 
         if (!shouldMute) {
@@ -529,6 +534,13 @@ function renderReplaceHtml(translatedText, messageId) {
     return `<div class="stft-render stft-replace-render">${renderInlineToggleButton(messageId, true)}${renderMarkdown(translatedText, messageId)}</div>`;
 }
 
+function getTextRenderKey(messageId, mode, version = null) {
+    const versionStamp = version
+        ? `${version.id || ''}:${version.editedAt || version.createdAt || ''}:${hashText(version.text || '')}`
+        : '';
+    return `${getMessageRecordKey(messageId)}:${mode}:${versionStamp}`;
+}
+
 function renderInlineToggleButton(messageId, visible = false) {
     const label = visible ? '取消译文' : '显示译文';
     const title = visible ? '取消当前楼层译文显示' : '显示这个回复已保存的译文';
@@ -560,6 +572,11 @@ function applyDisplay(messageId) {
     }
 
     const mode = record.displayMode || version.displayMode || settings.displayMode;
+    const renderKey = getTextRenderKey(messageId, mode, version);
+    if ($text.attr('data-stft-render-key') === renderKey) {
+        updateButtonState($mes);
+        return;
+    }
     const html = mode === displayModes.replace
         ? renderReplaceHtml(version.text, messageId)
         : renderCompareHtml(message.mes, version, messageId);
@@ -567,6 +584,7 @@ function applyDisplay(messageId) {
     if ($text.html() !== html) {
         $text.html(html);
     }
+    $text.attr('data-stft-render-key', renderKey);
     updateButtonState($mes);
 }
 
@@ -577,10 +595,21 @@ function restoreDisplay(messageId, updateRecord = true) {
     if ($text.length && message) {
         const record = loadStore().messages[getMessageRecordKey(messageId)];
         const hasTranslation = hasDisplayableVersion(record);
+        const renderKey = getTextRenderKey(messageId, hasTranslation ? 'original-toggle' : 'original');
+        if ($text.attr('data-stft-render-key') === renderKey) {
+            if (updateRecord) {
+                updateMessageRecord(messageId, nextRecord => {
+                    nextRecord.visible = false;
+                });
+            }
+            updateButtonState($mes);
+            return;
+        }
         const originalHtml = `${hasTranslation ? renderInlineToggleButton(messageId, false) : ''}${renderMarkdown(message.mes, messageId)}`;
         if ($text.html() !== originalHtml) {
             $text.html(originalHtml);
         }
+        $text.attr('data-stft-render-key', renderKey);
     }
     if (updateRecord) {
         updateMessageRecord(messageId, record => {
@@ -590,11 +619,11 @@ function restoreDisplay(messageId, updateRecord = true) {
     updateButtonState($mes);
 }
 
-function updateButtonState($mes, store = null) {
+function updateButtonState($mes, store = null, recordKey = null) {
     if (!$mes?.length) return;
     const messageId = String($mes.attr('mesid'));
     if (!store) store = loadStore();
-    const recordKey = getMessageRecordKey(messageId);
+    if (!recordKey) recordKey = getMessageRecordKey(messageId);
     const record = store.messages[recordKey];
     const hasTranslation = hasDisplayableVersion(record);
     const visible = Boolean(record?.visible && hasTranslation);
@@ -612,8 +641,18 @@ function updateButtonState($mes, store = null) {
         .attr('title', title);
 }
 
+function addPendingScanMessageId(messageId) {
+    if (messageId === undefined || messageId === null || messageId === '') return;
+    pendingScanMessageIds.add(String(messageId));
+}
+
 function queueScan(options = {}) {
     scanNeedsPrune = scanNeedsPrune || Boolean(options.prune);
+    scanNeedsFull = scanNeedsFull || Boolean(options.full);
+    if (options.messageId !== undefined) addPendingScanMessageId(options.messageId);
+    if (Array.isArray(options.messageIds)) {
+        for (const messageId of options.messageIds) addPendingScanMessageId(messageId);
+    }
     clearTimeout(scanTimer);
     scanTimer = setTimeout(() => {
         if (scanNeedsPrune) {
@@ -621,53 +660,100 @@ function queueScan(options = {}) {
         }
         scanNeedsPrune = false;
         const store = loadStore();
-        ensureMessageButtons(store);
-        reapplyVisibleDisplays(store);
+        const messageIds = Array.from(pendingScanMessageIds);
+        pendingScanMessageIds.clear();
+        const shouldFullScan = scanNeedsFull || !messageIds.length;
+        scanNeedsFull = false;
+        if (shouldFullScan) {
+            scanMessageElements($('#chat .mes'), store, { async: true, reverse: true });
+        } else {
+            for (const messageId of messageIds) {
+                const $mes = getMessageElement(messageId);
+                if ($mes.length) processMessageElement($mes, store);
+            }
+        }
     }, 80);
 }
 
-function ensureMessageButtons(store = loadStore()) {
-    $('#chat .mes').each((_, element) => {
-        const $mes = $(element);
-        $mes.find(`.${LEGACY_TOGGLE_CLASS}, .${LEGACY_PANEL_CLASS}`).remove();
-        if (!isTranslatableMessage($mes)) {
-            $mes.find(`.${BUTTON_CLASS}`).remove();
-            return;
-        }
-        const $buttons = $mes.find('.extraMesButtons').first();
-        if (!$buttons.length) return;
+function processMessageElement($mes, store = loadStore()) {
+    if (!$mes?.length) return;
+    const messageId = String($mes.attr('mesid'));
+    const recordKey = getMessageRecordKey(messageId);
+    const record = store.messages[recordKey];
 
-        if (!$buttons.find(`.${BUTTON_CLASS}`).length) {
-            $buttons.append(`<div title="楼层翻译" class="mes_button ${BUTTON_CLASS} fa-solid fa-language"></div>`);
+    $mes.find(`.${LEGACY_TOGGLE_CLASS}, .${LEGACY_PANEL_CLASS}`).remove();
+    if (!isTranslatableMessage($mes)) {
+        $mes.find(`.${BUTTON_CLASS}`).remove();
+        return;
+    }
+
+    const $buttons = $mes.find('.extraMesButtons').first();
+    if ($buttons.length && !$buttons.find(`.${BUTTON_CLASS}`).length) {
+        $buttons.append(`<div title="楼层翻译" class="mes_button ${BUTTON_CLASS} fa-solid fa-language"></div>`);
+    }
+
+    if (record?.visible && getSelectedVersion(record)) {
+        applyDisplay(messageId);
+    } else {
+        const hasPluginRender = Boolean($mes.find('.mes_text .stft-render').length);
+        const hasInlineToggle = Boolean($mes.find(`.mes_text .${INLINE_TOGGLE_CLASS}`).length);
+        if (hasPluginRender || (!hasDisplayableVersion(record) && hasInlineToggle)) {
+            restoreDisplay(messageId, false);
+        } else if (hasDisplayableVersion(record) && !hasInlineToggle) {
+            ensureHiddenInlineToggle($mes, messageId);
         }
-        updateButtonState($mes, store);
-    });
+        updateButtonState($mes, store, recordKey);
+    }
+}
+
+function scheduleScanChunk(callback) {
+    if (typeof window.requestIdleCallback === 'function') {
+        window.requestIdleCallback(callback, { timeout: 350 });
+    } else {
+        setTimeout(() => callback(null), 16);
+    }
+}
+
+function scanMessageElements($messages, store = loadStore(), options = {}) {
+    const elements = $messages.toArray();
+    if (options.reverse) elements.reverse();
+    if (!options.async || elements.length <= 24) {
+        for (const element of elements) {
+            processMessageElement($(element), store);
+        }
+        return;
+    }
+
+    const token = ++fullScanToken;
+    let index = 0;
+    const runChunk = deadline => {
+        if (token !== fullScanToken) return;
+        const startedAt = performance.now();
+        while (index < elements.length) {
+            processMessageElement($(elements[index]), store);
+            index += 1;
+            const hasIdleBudget = performance.now() - startedAt < 8
+                && (!deadline || typeof deadline.timeRemaining !== 'function' || deadline.timeRemaining() > 3);
+            if (!hasIdleBudget) break;
+        }
+        if (index < elements.length) scheduleScanChunk(runChunk);
+    };
+    scheduleScanChunk(runChunk);
+}
+
+function ensureMessageButtons(store = loadStore()) {
+    scanMessageElements($('#chat .mes'), store);
 }
 
 function ensureHiddenInlineToggle($mes, messageId) {
     const $text = $mes.find('.mes_text').first();
     if (!$text.length || $text.children(`.${INLINE_TOGGLE_CLASS}`).first().length) return;
     $text.prepend(renderInlineToggleButton(messageId, false));
+    $text.attr('data-stft-render-key', getTextRenderKey(messageId, 'original-toggle'));
 }
 
 function reapplyVisibleDisplays(store = loadStore()) {
-    $('#chat .mes').each((_, element) => {
-        const $mes = $(element);
-        const messageId = String($mes.attr('mesid'));
-        const record = store.messages[getMessageRecordKey(messageId)];
-        if (record?.visible && getSelectedVersion(record)) {
-            applyDisplay(messageId);
-        } else {
-            const hasPluginRender = Boolean($mes.find('.mes_text .stft-render').length);
-            const hasInlineToggle = Boolean($mes.find(`.mes_text .${INLINE_TOGGLE_CLASS}`).length);
-            if (hasPluginRender || (!hasDisplayableVersion(record) && hasInlineToggle)) {
-                restoreDisplay(messageId, false);
-            } else if (hasDisplayableVersion(record) && !hasInlineToggle) {
-                ensureHiddenInlineToggle($mes, messageId);
-            }
-            updateButtonState($mes, store);
-        }
-    });
+    scanMessageElements($('#chat .mes'), store);
 }
 
 function resolveTargetLanguage(localValue = null, customValue = null) {
@@ -1613,7 +1699,7 @@ function bindSettingsPanel() {
     $('#stft_auto_show').on('change', event => setAndSave('autoShow', event.target.checked));
     $('#stft_translate_users').on('change', event => {
         setAndSave('translateUserMessages', event.target.checked);
-        queueScan();
+        queueScan({ full: true });
     });
     $('#stft_suppress_builtin_swipe_translate').on('change', event => {
         setAndSave('suppressBuiltinSwipeTranslate', event.target.checked);
@@ -1891,7 +1977,8 @@ function bindFloorModal(messageId) {
     });
 
     $('.stft-version').on('click', function (event) {
-        if ($(event.target).closest('[data-stft-edit], [data-stft-delete], [data-stft-save], [data-stft-cancel]').length) return;
+        if ($(this).hasClass('stft-version-editing')) return;
+        if ($(event.target).closest('[data-stft-edit], [data-stft-delete], [data-stft-save], [data-stft-cancel], .stft-version-editor, .stft-version-edit-actions, textarea, input, select, button').length) return;
         const versionId = String($(this).data('version-id'));
         updateMessageRecord(messageId, record => {
             record.selectedId = versionId;
@@ -1920,12 +2007,26 @@ function startEditVersion($version) {
     const version = record.versions.find(item => item.id === versionId);
     if (!version) return;
 
+    $version.addClass('stft-version-editing');
     $version.find('.stft-version-preview').replaceWith(`
         <textarea class="text_pole stft-version-editor" spellcheck="false">${escapeHtml(version.text)}</textarea>
-        <div class="stft-row marginTop5">
+        <div class="stft-row marginTop5 stft-version-edit-actions">
             <div class="menu_button menu_button_icon fa-solid fa-check" data-stft-save title="保存"></div>
             <div class="menu_button menu_button_icon fa-solid fa-xmark" data-stft-cancel title="取消"></div>
         </div>`);
+
+    $version.find('.stft-version-editor, .stft-version-edit-actions').on('click', event => {
+        event.stopPropagation();
+    });
+    requestAnimationFrame(() => {
+        $version[0]?.scrollIntoView?.({ block: 'center', behavior: 'smooth' });
+        const editor = $version.find('.stft-version-editor')[0];
+        try {
+            editor?.focus?.({ preventScroll: true });
+        } catch {
+            editor?.focus?.();
+        }
+    });
 
     $version.find('[data-stft-save]').on('click', event => {
         event.stopPropagation();
@@ -2006,30 +2107,28 @@ function bindEvents() {
     const eventsToScan = [
         event_types.CHARACTER_MESSAGE_RENDERED,
         event_types.USER_MESSAGE_RENDERED,
-        event_types.GENERATION_ENDED,
-        event_types.GENERATION_STOPPED,
     ];
     for (const eventName of eventsToScan) {
-        eventSource.on(eventName, () => queueScan());
+        eventSource.on(eventName, payload => queueScan({ messageId: getEventMessageId(payload) }));
     }
-    eventSource.on(event_types.CHAT_CHANGED, () => queueScan({ prune: true }));
+    eventSource.on(event_types.CHAT_CHANGED, () => queueScan({ full: true, prune: true }));
     eventSource.on(event_types.MESSAGE_UPDATED, payload => {
         const messageId = getEventMessageId(payload);
-        queueScan();
+        queueScan({ messageId });
         refreshModalIfOpen(messageId);
     });
     eventSource.on(event_types.MESSAGE_SWIPED, payload => {
         const messageId = getEventMessageId(payload);
-        queueScan();
+        queueScan({ messageId });
         refreshModalIfOpen(messageId);
     });
     eventSource.on(event_types.MESSAGE_SWIPE_DELETED, payload => {
         const messageId = getEventMessageId(payload);
-        queueScan({ prune: true });
+        queueScan({ messageId, prune: true });
         refreshModalIfOpen(messageId);
     });
     eventSource.on(event_types.MESSAGE_DELETED, () => {
-        queueScan({ prune: true });
+        queueScan({ full: true, prune: true });
         const modalMessageId = $(`#${MODAL_ID}`).data('message-id');
         if (modalMessageId !== undefined && !getMessageData(modalMessageId)) {
             closeFloorModal();
@@ -2040,7 +2139,22 @@ function bindEvents() {
 function startObserver() {
     const chat = document.querySelector('#chat');
     if (!chat) return;
-    observer = new MutationObserver(queueScan);
+    observer = new MutationObserver(mutations => {
+        const messageIds = [];
+        for (const mutation of mutations) {
+            for (const node of mutation.addedNodes) {
+                if (!(node instanceof HTMLElement)) continue;
+                if (node.matches?.('#chat .mes, .mes')) {
+                    const messageId = node.getAttribute('mesid');
+                    if (messageId !== null) messageIds.push(messageId);
+                }
+                node.querySelectorAll?.('.mes[mesid]').forEach(element => {
+                    messageIds.push(element.getAttribute('mesid'));
+                });
+            }
+        }
+        if (messageIds.length) queueScan({ messageIds });
+    });
     observer.observe(chat, { childList: true });
 }
 
@@ -2053,9 +2167,8 @@ async function init() {
         bindEvents();
         pruneMissingRecords();
         const store = loadStore();
-        ensureMessageButtons(store);
+        scanMessageElements($('#chat .mes'), store, { async: true, reverse: true });
         startObserver();
-        reapplyVisibleDisplays(store);
         console.info('[Floor Translator] loaded');
     } catch (error) {
         console.error('[Floor Translator] init failed', error);
