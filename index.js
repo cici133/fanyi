@@ -29,6 +29,14 @@ const requestModes = {
     simple: 'simple',
 };
 
+const translationChannels = {
+    ai: 'ai',
+    google: 'google',
+    microsoft: 'microsoft',
+};
+
+const machineConcurrency = 4;
+
 const languages = [
     ['auto', '自动识别'],
     ['Chinese (Simplified)', '中文（简体）'],
@@ -86,6 +94,40 @@ const languagePromptNames = {
     Indonesian: '印尼语',
 };
 
+const googleLanguageCodes = {
+    'Chinese (Simplified)': 'zh-CN',
+    'Chinese (Traditional)': 'zh-TW',
+    English: 'en',
+    Japanese: 'ja',
+    Korean: 'ko',
+    French: 'fr',
+    German: 'de',
+    Spanish: 'es',
+    Italian: 'it',
+    Portuguese: 'pt',
+    Russian: 'ru',
+    Ukrainian: 'uk',
+    Polish: 'pl',
+    Dutch: 'nl',
+    Swedish: 'sv',
+    Norwegian: 'no',
+    Finnish: 'fi',
+    Danish: 'da',
+    Turkish: 'tr',
+    Arabic: 'ar',
+    Hindi: 'hi',
+    Thai: 'th',
+    Vietnamese: 'vi',
+    Indonesian: 'id',
+};
+
+const microsoftLanguageCodes = {
+    ...googleLanguageCodes,
+    'Chinese (Simplified)': 'zh-Hans',
+    'Chinese (Traditional)': 'zh-Hant',
+    Norwegian: 'nb',
+};
+
 const defaultPrompts = [
     {
         id: 'standard',
@@ -120,12 +162,16 @@ const defaultPrompts = [
 ];
 
 const defaultSettings = {
+    translationChannel: translationChannels.ai,
     endpoint: '',
     model: 'gpt-4o-mini',
     apiKey: '',
     authMode: authModes.bearer,
     customAuthHeader: 'Authorization',
     requestMode: requestModes.tavern,
+    microsoftKey: '',
+    microsoftRegion: '',
+    microsoftEndpoint: 'https://api.cognitive.microsofttranslator.com',
     temperature: 0.2,
     maxTokens: 4000,
     sourceLanguage: 'auto',
@@ -562,6 +608,39 @@ function getLanguagePromptName(value) {
     return languagePromptNames[value] || String(value || '').trim() || '目标语言';
 }
 
+function isAiChannel() {
+    return settings.translationChannel === translationChannels.ai;
+}
+
+function getChannelName(channel = settings.translationChannel) {
+    if (channel === translationChannels.google) return 'Google 快速翻译';
+    if (channel === translationChannels.microsoft) return 'Microsoft Translator';
+    return 'AI 副 API';
+}
+
+function getMachineLanguageCode(language, channel = settings.translationChannel) {
+    const value = String(language || '').trim();
+    if (!value || value === 'auto') return 'auto';
+    if (value === 'custom') {
+        return String(settings.customTargetLanguage || '').trim();
+    }
+    const map = channel === translationChannels.microsoft ? microsoftLanguageCodes : googleLanguageCodes;
+    const lower = value.toLowerCase();
+    if (/简体|簡体|中文|汉语|漢語|chinese|zh-cn|zh-hans/.test(lower)) {
+        return channel === translationChannels.microsoft ? 'zh-Hans' : 'zh-CN';
+    }
+    if (/繁体|繁體|zh-tw|zh-hant/.test(lower)) {
+        return channel === translationChannels.microsoft ? 'zh-Hant' : 'zh-TW';
+    }
+    return map[value] || value;
+}
+
+function decodeHtmlEntities(value) {
+    const textarea = document.createElement('textarea');
+    textarea.innerHTML = String(value ?? '');
+    return textarea.value;
+}
+
 function getPromptById(id) {
     return settings.prompts.find(prompt => prompt.id === id) || settings.prompts[0] || defaultPrompts[0];
 }
@@ -873,6 +952,147 @@ async function requestDirectly(endpoint, body) {
     }
 }
 
+function getMachineSourceCode(channel) {
+    const source = getMachineLanguageCode(settings.sourceLanguage, channel);
+    return source === 'auto' || !source ? 'auto' : source;
+}
+
+function getMachineTargetCode(language, channel) {
+    const target = getMachineLanguageCode(language, channel);
+    if (!target || target === 'auto') {
+        throw new Error('机器翻译渠道需要明确的目标语言。请选择中文、英文等具体语言，或在自定义目标语言里填写语言代码。');
+    }
+    return target;
+}
+
+async function translateWithGoogleWeb(text, targetLanguage) {
+    const target = getMachineTargetCode(targetLanguage, translationChannels.google);
+    const source = getMachineSourceCode(translationChannels.google);
+    const url = new URL('https://translate.googleapis.com/translate_a/single');
+    url.searchParams.set('client', 'gtx');
+    url.searchParams.set('sl', source);
+    url.searchParams.set('tl', target);
+    url.searchParams.set('dt', 't');
+    url.searchParams.set('q', text);
+
+    const response = await fetch(url.toString(), { method: 'GET', cache: 'no-cache' });
+    const raw = await response.text();
+    if (!response.ok) throw new Error(`Google 翻译 ${response.status}: ${raw || response.statusText}`);
+
+    let data;
+    try {
+        data = JSON.parse(raw);
+    } catch {
+        throw new Error('Google 翻译返回了无法解析的内容。');
+    }
+
+    const translated = Array.isArray(data?.[0])
+        ? data[0].map(part => part?.[0] || '').join('')
+        : '';
+    if (!translated.trim()) throw new Error('Google 翻译没有返回译文。');
+    return decodeHtmlEntities(translated.trim());
+}
+
+function getMicrosoftTranslateUrl() {
+    const base = String(settings.microsoftEndpoint || 'https://api.cognitive.microsofttranslator.com').trim().replace(/\/+$/, '');
+    if (!base) throw new Error('请填写 Microsoft Translator Endpoint。');
+    if (/\/translate$/i.test(base)) return base;
+    if (/\.cognitiveservices\.azure\.com/i.test(base) && !/\/translator\/text\/v3\.0$/i.test(base)) {
+        return `${base}/translator/text/v3.0/translate`;
+    }
+    if (/\/translator\/text\/v3\.0$/i.test(base)) {
+        return `${base}/translate`;
+    }
+    return `${base}/translate`;
+}
+
+async function translateWithMicrosoft(text, targetLanguage) {
+    const key = String(settings.microsoftKey || '').trim();
+    if (!key) throw new Error('请先填写 Microsoft Translator Key。');
+
+    const target = getMachineTargetCode(targetLanguage, translationChannels.microsoft);
+    const source = getMachineSourceCode(translationChannels.microsoft);
+    const url = new URL(getMicrosoftTranslateUrl());
+    url.searchParams.set('api-version', '3.0');
+    url.searchParams.set('to', target);
+    if (source !== 'auto') url.searchParams.set('from', source);
+
+    const headers = {
+        'Content-Type': 'application/json',
+        'Ocp-Apim-Subscription-Key': key,
+    };
+    const region = String(settings.microsoftRegion || '').trim();
+    if (region) headers['Ocp-Apim-Subscription-Region'] = region;
+
+    const response = await fetch(url.toString(), {
+        method: 'POST',
+        headers,
+        body: JSON.stringify([{ Text: text }]),
+    });
+    const raw = await response.text();
+    let data = null;
+    try {
+        data = raw ? JSON.parse(raw) : null;
+    } catch {
+        data = null;
+    }
+    if (!response.ok) {
+        const message = data?.error?.message || raw || response.statusText;
+        throw new Error(`Microsoft 翻译 ${response.status}: ${message}`);
+    }
+    const translated = data?.[0]?.translations?.[0]?.text || '';
+    if (!translated.trim()) throw new Error('Microsoft Translator 没有返回译文。');
+    return decodeHtmlEntities(translated.trim());
+}
+
+async function requestMachineTranslationText(sourceText, options, onProgress) {
+    const channel = options.channel || settings.translationChannel;
+    const sourceSegments = getSourceSegments(sourceText);
+    const resultSegments = sourceSegments.map(segment => ({
+        id: segment.id,
+        source: segment.source,
+        translation: '',
+    }));
+    let completed = 0;
+    let nextIndex = 0;
+    const total = resultSegments.length;
+    const translateOne = channel === translationChannels.microsoft ? translateWithMicrosoft : translateWithGoogleWeb;
+
+    const emitProgress = () => {
+        const text = resultSegments.map(segment => segment.translation || '').filter(Boolean).join('\n\n').trim();
+        onProgress?.({
+            text,
+            segments: resultSegments.map(segment => ({ ...segment })),
+            completed,
+            total,
+            channel,
+        });
+    };
+
+    const worker = async () => {
+        while (nextIndex < total) {
+            const index = nextIndex;
+            nextIndex += 1;
+            const segment = resultSegments[index];
+            segment.translation = await translateOne(segment.source, options.language);
+            completed += 1;
+            emitProgress();
+        }
+    };
+
+    const workers = Array.from({ length: Math.min(machineConcurrency, Math.max(total, 1)) }, () => worker());
+    await Promise.all(workers);
+    const text = resultSegments.map(segment => segment.translation || '').filter(Boolean).join('\n\n').trim();
+    if (!text) throw new Error(`${getChannelName(channel)} 没有生成译文。`);
+    return {
+        text,
+        segments: resultSegments,
+        raw: text,
+        usedFallback: false,
+        looksUntranslated: isProbablyUntranslated(resultSegments, options.language),
+    };
+}
+
 async function requestTranslationText(sourceText, options) {
     const endpoint = normalizeEndpoint(settings.endpoint);
     if (!endpoint) throw new Error('请先在扩展设置里填写副 API / 反代地址。');
@@ -945,6 +1165,8 @@ async function requestTranslation(messageId, options, sourceText = getMessageSou
 async function translateMessage(messageId, options = {}) {
     const recordKey = getMessageRecordKey(messageId);
     const sourceText = getMessageSourceText(messageId);
+    const channel = settings.translationChannel || translationChannels.ai;
+    const channelName = getChannelName(channel);
     if (inFlight.has(recordKey)) return;
 
     const localOptions = {
@@ -952,12 +1174,13 @@ async function translateMessage(messageId, options = {}) {
         presetId: options.presetId || settings.activePresetId,
         displayMode: options.displayMode || settings.displayMode,
         autoShow: options.autoShow ?? settings.autoShow,
+        channel,
     };
 
     inFlight.set(recordKey, true);
     updateMessageRecord(messageId, record => {
         record.status = 'loading';
-        record.statusText = '正在请求翻译 API，等待模型返回...';
+        record.statusText = channel === translationChannels.ai ? '正在请求翻译 API，等待模型返回...' : `正在使用${channelName}快速翻译...`;
         record.language = localOptions.language;
         record.presetId = localOptions.presetId;
         record.displayMode = localOptions.displayMode;
@@ -966,6 +1189,85 @@ async function translateMessage(messageId, options = {}) {
     refreshModalIfOpen(messageId);
 
     try {
+        if (channel !== translationChannels.ai) {
+            const versionId = makeId('ver');
+            const sourceSegments = getSourceSegments(sourceText);
+            const version = {
+                id: versionId,
+                text: '',
+                segments: sourceSegments.map(segment => ({ ...segment, translation: '' })),
+                usedFallback: false,
+                language: localOptions.language,
+                presetId: channel,
+                presetName: channelName,
+                provider: channel,
+                displayMode: localOptions.displayMode,
+                createdAt: new Date().toISOString(),
+                sourceHash: hashText(sourceText),
+            };
+
+            updateMessageRecord(messageId, record => {
+                record.status = 'loading';
+                record.statusText = `正在使用${channelName}快速翻译 0/${sourceSegments.length}...`;
+                record.versions.push(version);
+                record.selectedId = version.id;
+                record.visible = Boolean(localOptions.autoShow);
+                record.displayMode = localOptions.displayMode;
+            }, recordKey);
+
+            if (localOptions.autoShow && getMessageRecordKey(messageId) === recordKey) applyDisplay(messageId);
+
+            const result = await requestMachineTranslationText(sourceText, localOptions, progress => {
+                const statusText = `${channelName} 已翻译 ${progress.completed}/${progress.total} 段...`;
+                updateMessageRecord(messageId, record => {
+                    const target = record.versions.find(item => item.id === versionId);
+                    if (target) {
+                        target.text = progress.text;
+                        target.segments = progress.segments;
+                    }
+                    record.status = 'loading';
+                    record.statusText = statusText;
+                    record.selectedId = versionId;
+                    record.visible = Boolean(localOptions.autoShow);
+                }, recordKey);
+                if (localOptions.autoShow && getMessageRecordKey(messageId) === recordKey) applyDisplay(messageId);
+                const $modal = $(`#${MODAL_ID}`);
+                if ($modal.length && String($modal.data('message-id')) === String(messageId)) {
+                    $('#stft_modal_status').text(statusText);
+                }
+            });
+
+            if (result.looksUntranslated) {
+                updateMessageRecord(messageId, record => {
+                    record.visible = false;
+                    record.status = 'error';
+                    record.statusText = `${channelName} 返回的译文疑似仍是原文，已停止显示。`;
+                }, recordKey);
+                if (getMessageRecordKey(messageId) === recordKey) restoreDisplay(messageId, false);
+                throw new Error(`${channelName} 返回的译文疑似仍是原文，已停止显示。请确认目标语言设置。`);
+            }
+
+            updateMessageRecord(messageId, record => {
+                const target = record.versions.find(item => item.id === versionId);
+                if (target) {
+                    target.text = result.text;
+                    target.segments = result.segments;
+                    target.usedFallback = false;
+                }
+                record.status = 'success';
+                record.statusText = `${channelName} 翻译完成。`;
+                record.selectedId = versionId;
+                record.visible = Boolean(localOptions.autoShow);
+                record.displayMode = localOptions.displayMode;
+            }, recordKey);
+
+            if (localOptions.autoShow && getMessageRecordKey(messageId) === recordKey) applyDisplay(messageId);
+            else updateButtonState(getMessageElement(messageId));
+            refreshModalIfOpen(messageId);
+            toastr?.success?.(`${channelName} 翻译完成。`);
+            return;
+        }
+
         const result = await requestTranslation(messageId, localOptions, sourceText);
         const prompt = getPromptById(localOptions.presetId);
         const version = {
@@ -1042,19 +1344,26 @@ function renderSettingsPanel() {
                 </div>
                 <div class="inline-drawer-content">
                     <div class="stft-grid">
-                        <label class="stft-span-2">副 API / 反代地址
+                        <label class="stft-span-2">翻译渠道
+                            <select id="stft_translation_channel" class="text_pole">
+                                <option value="${translationChannels.ai}"${settings.translationChannel === translationChannels.ai ? ' selected' : ''}>AI 副 API</option>
+                                <option value="${translationChannels.google}"${settings.translationChannel === translationChannels.google ? ' selected' : ''}>Google 快速翻译（免密）</option>
+                                <option value="${translationChannels.microsoft}"${settings.translationChannel === translationChannels.microsoft ? ' selected' : ''}>Microsoft Translator</option>
+                            </select>
+                        </label>
+                        <label class="stft-span-2 stft-ai-setting">副 API / 反代地址
                             <input id="stft_endpoint" class="text_pole" placeholder="https://example.com/v1" value="${escapeHtml(settings.endpoint)}">
                         </label>
-                        <label>模型
+                        <label class="stft-ai-setting">模型
                             <input id="stft_model" class="text_pole" placeholder="gpt-4o-mini" value="${escapeHtml(settings.model)}">
                         </label>
-                        <label>温度
+                        <label class="stft-ai-setting">温度
                             <input id="stft_temperature" class="text_pole" type="number" step="0.1" min="0" max="2" value="${escapeHtml(settings.temperature)}">
                         </label>
-                        <label>API Key / 反代密码
+                        <label class="stft-ai-setting">API Key / 反代密码
                             <input id="stft_api_key" class="text_pole" type="password" autocomplete="off" value="${escapeHtml(settings.apiKey)}">
                         </label>
-                        <label>鉴权方式
+                        <label class="stft-ai-setting">鉴权方式
                             <select id="stft_auth_mode" class="text_pole">
                                 <option value="${authModes.bearer}"${settings.authMode === authModes.bearer ? ' selected' : ''}>Authorization: Bearer</option>
                                 <option value="${authModes.xApiKey}"${settings.authMode === authModes.xApiKey ? ' selected' : ''}>x-api-key</option>
@@ -1062,18 +1371,27 @@ function renderSettingsPanel() {
                                 <option value="${authModes.none}"${settings.authMode === authModes.none ? ' selected' : ''}>不发送密码</option>
                             </select>
                         </label>
-                        <label>请求方式
+                        <label class="stft-ai-setting">请求方式
                             <select id="stft_request_mode" class="text_pole">
                                 <option value="${requestModes.tavern}"${settings.requestMode === requestModes.tavern ? ' selected' : ''}>酒馆内置通道（推荐，无 CORS）</option>
                                 <option value="${requestModes.standard}"${settings.requestMode === requestModes.standard ? ' selected' : ''}>前端直连：标准 JSON</option>
                                 <option value="${requestModes.simple}"${settings.requestMode === requestModes.simple ? ' selected' : ''}>前端直连：兼容模式</option>
                             </select>
                         </label>
-                        <label id="stft_custom_header_label">自定义请求头名
+                        <label id="stft_custom_header_label" class="stft-ai-setting">自定义请求头名
                             <input id="stft_custom_header" class="text_pole" value="${escapeHtml(settings.customAuthHeader)}">
                         </label>
-                        <label>最大输出 tokens
+                        <label class="stft-ai-setting">最大输出 tokens
                             <input id="stft_max_tokens" class="text_pole" type="number" min="0" step="1" value="${escapeHtml(settings.maxTokens)}">
+                        </label>
+                        <label class="stft-span-2 stft-microsoft-setting">Microsoft Translator Endpoint
+                            <input id="stft_microsoft_endpoint" class="text_pole" placeholder="https://api.cognitive.microsofttranslator.com" value="${escapeHtml(settings.microsoftEndpoint)}">
+                        </label>
+                        <label class="stft-microsoft-setting">Microsoft Key
+                            <input id="stft_microsoft_key" class="text_pole" type="password" autocomplete="off" value="${escapeHtml(settings.microsoftKey)}">
+                        </label>
+                        <label class="stft-microsoft-setting">Microsoft Region
+                            <input id="stft_microsoft_region" class="text_pole" placeholder="可留空，区域资源才填写" value="${escapeHtml(settings.microsoftRegion)}">
                         </label>
                         <label>源语言
                             <select id="stft_source_language" class="text_pole">${languageOptions(settings.sourceLanguage)}</select>
@@ -1090,7 +1408,7 @@ function renderSettingsPanel() {
                                 <option value="${displayModes.replace}"${settings.displayMode === displayModes.replace ? ' selected' : ''}>只显示译文，替换正文</option>
                             </select>
                         </label>
-                        <label>默认提示词预设
+                        <label class="stft-ai-setting">默认提示词预设
                             <select id="stft_prompt_select" class="text_pole">${promptOptions(settings.activePresetId)}</select>
                         </label>
                         <label class="checkbox_label stft-span-2">
@@ -1101,17 +1419,17 @@ function renderSettingsPanel() {
                             <input id="stft_translate_users" type="checkbox"${settings.translateUserMessages ? ' checked' : ''}>
                             用户消息也显示楼层翻译按钮
                         </label>
-                        <label class="stft-span-2">当前预设名称
+                        <label class="stft-span-2 stft-ai-setting">当前预设名称
                             <input id="stft_prompt_name" class="text_pole" value="${escapeHtml(prompt.name)}">
                         </label>
-                        <label class="stft-span-2">提示词内容
+                        <label class="stft-span-2 stft-ai-setting">提示词内容
                             <textarea id="stft_prompt_text" class="text_pole" spellcheck="false">${escapeHtml(prompt.text)}</textarea>
                         </label>
                     </div>
                     <div class="stft-row marginTop10">
-                        <div id="stft_prompt_save" class="menu_button">保存预设</div>
-                        <div id="stft_prompt_new" class="menu_button"><i class="fa-solid fa-plus"></i><span>新建</span></div>
-                        <div id="stft_prompt_delete" class="menu_button"><i class="fa-solid fa-trash-can"></i><span>删除</span></div>
+                        <div id="stft_prompt_save" class="menu_button stft-ai-setting">保存预设</div>
+                        <div id="stft_prompt_new" class="menu_button stft-ai-setting"><i class="fa-solid fa-plus"></i><span>新建</span></div>
+                        <div id="stft_prompt_delete" class="menu_button stft-ai-setting"><i class="fa-solid fa-trash-can"></i><span>删除</span></div>
                         <div id="stft_test_api" class="menu_button"><i class="fa-solid fa-plug"></i><span>测试 API</span></div>
                     </div>
                     <div id="stft_global_status" class="stft-status stft-muted marginTop10">
@@ -1131,6 +1449,10 @@ function bindSettingsPanel() {
         saveSettings();
     };
 
+    $('#stft_translation_channel').on('change', event => {
+        setAndSave('translationChannel', event.target.value);
+        refreshConditionalSettings();
+    });
     $('#stft_endpoint').on('input', event => setAndSave('endpoint', event.target.value.trim()));
     $('#stft_model').on('input', event => {
         setAndSave('model', event.target.value.trim());
@@ -1146,6 +1468,9 @@ function bindSettingsPanel() {
         refreshConditionalSettings();
     });
     $('#stft_custom_header').on('input', event => setAndSave('customAuthHeader', event.target.value.trim()));
+    $('#stft_microsoft_endpoint').on('input', event => setAndSave('microsoftEndpoint', event.target.value.trim()));
+    $('#stft_microsoft_key').on('input', event => setAndSave('microsoftKey', event.target.value));
+    $('#stft_microsoft_region').on('input', event => setAndSave('microsoftRegion', event.target.value.trim()));
     $('#stft_temperature').on('input', event => setAndSave('temperature', Number(event.target.value)));
     $('#stft_max_tokens').on('input', event => setAndSave('maxTokens', Number(event.target.value)));
     $('#stft_source_language').on('change', event => setAndSave('sourceLanguage', event.target.value));
@@ -1175,10 +1500,22 @@ function bindSettingsPanel() {
 
 function refreshConditionalSettings() {
     const simpleMode = settings.requestMode === requestModes.simple;
-    $('#stft_custom_header_label').toggle(settings.authMode === authModes.custom && !simpleMode);
-    $('#stft_api_key').closest('label').toggle(!simpleMode);
-    $('#stft_auth_mode').closest('label').toggle(!simpleMode);
+    const aiChannel = settings.translationChannel === translationChannels.ai;
+    const microsoftChannel = settings.translationChannel === translationChannels.microsoft;
+    $('.stft-ai-setting').toggle(aiChannel);
+    $('.stft-microsoft-setting').toggle(microsoftChannel);
+    $('#stft_custom_header_label').toggle(aiChannel && settings.authMode === authModes.custom && !simpleMode);
+    $('#stft_api_key').closest('label').toggle(aiChannel && !simpleMode);
+    $('#stft_auth_mode').closest('label').toggle(aiChannel && !simpleMode);
     $('#stft_custom_language_label').toggle(settings.targetLanguage === 'custom');
+    if ($('#stft_global_status').length) {
+        const statusText = aiChannel
+            ? '副 API 独立于酒馆主 API。推荐使用酒馆内置通道：不改酒馆本体，只调用酒馆已有生成接口。'
+            : microsoftChannel
+                ? 'Microsoft Translator 为快速机器翻译渠道，按段落并发请求，边返回边显示；需要填写 Key，区域资源再填写 Region。'
+                : 'Google 快速翻译为免密机器翻译渠道，按段落并发请求，边返回边显示；如果浏览器或网络拦截，会在楼层状态里报错。';
+        $('#stft_global_status').text(statusText);
+    }
 }
 
 function refreshPromptSelect() {
@@ -1238,15 +1575,20 @@ function deleteCurrentPrompt() {
 }
 
 async function testApi() {
-    $('#stft_global_status').text('正在测试 API...');
+    $('#stft_global_status').text(`正在测试${getChannelName()}...`);
     try {
-        const result = await requestTranslationText('The rain had stopped, but the city still smelled like summer thunder.', {
+        const sample = 'The rain had stopped, but the city still smelled like summer thunder.';
+        const options = {
             language: resolveTargetLanguage(),
             presetId: settings.activePresetId,
-        });
-        $('#stft_global_status').text(`API 测试成功：${result.text.slice(0, 120)}`);
+            channel: settings.translationChannel,
+        };
+        const result = isAiChannel()
+            ? await requestTranslationText(sample, options)
+            : await requestMachineTranslationText(sample, options);
+        $('#stft_global_status').text(`${getChannelName()}测试成功：${result.text.slice(0, 120)}`);
     } catch (error) {
-        $('#stft_global_status').text(`API 测试失败：${error.message}`);
+        $('#stft_global_status').text(`${getChannelName()}测试失败：${error.message}`);
     }
 }
 
@@ -1264,6 +1606,8 @@ function buildFloorModal(messageId) {
     const selected = getSelectedVersion(record);
     const replyLabel = getReplyLabel(messageId);
     const titleSuffix = replyLabel ? ` · ${replyLabel}` : '';
+    const channelName = getChannelName();
+    const aiChannel = settings.translationChannel === translationChannels.ai;
 
     return `
         <div id="${MODAL_ID}" data-message-id="${escapeHtml(messageId)}">
@@ -1274,6 +1618,7 @@ function buildFloorModal(messageId) {
                 </div>
                 <div class="stft-modal-body">
                     <div class="stft-status" id="stft_modal_status">${escapeHtml(record.statusText || '未开始')}</div>
+                    <div class="stft-muted">当前渠道：${escapeHtml(channelName)}</div>
                     <div class="stft-grid">
                         <label>目标语言
                             <select id="stft_modal_language" class="text_pole">${languageOptions(selectedLanguage)}</select>
@@ -1281,9 +1626,9 @@ function buildFloorModal(messageId) {
                         <label id="stft_modal_custom_language_label">自定义目标语言
                             <input id="stft_modal_custom_language" class="text_pole" value="${escapeHtml(customLanguage)}">
                         </label>
-                        <label>提示词预设
+                        ${aiChannel ? `<label>提示词预设
                             <select id="stft_modal_preset" class="text_pole">${promptOptions(record.presetId || settings.activePresetId)}</select>
-                        </label>
+                        </label>` : ''}
                         <label>显示模式
                             <select id="stft_modal_mode" class="text_pole">
                                 <option value="${displayModes.compare}"${record.displayMode === displayModes.compare ? ' selected' : ''}>每段原文 + 译文对照</option>
@@ -1297,7 +1642,7 @@ function buildFloorModal(messageId) {
                     </label>
                     <div class="stft-row">
                         <div id="stft_modal_translate" class="menu_button">
-                            <i class="fa-solid fa-rotate"></i><span>${record.versions.length ? '刷新翻译' : '开始翻译'}</span>
+                            <i class="fa-solid fa-rotate"></i><span>${record.versions.length ? (aiChannel ? '刷新翻译' : '重新快速翻译') : (aiChannel ? '开始翻译' : '快速翻译')}</span>
                         </div>
                         <div id="stft_modal_toggle" class="menu_button">
                             <i class="fa-solid fa-language"></i><span>${record.visible ? '取消译文' : '显示译文'}</span>
