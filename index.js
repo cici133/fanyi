@@ -213,6 +213,7 @@ const inFlight = new Map();
 const liveTranslations = new Map();
 const mutedLiveDisplays = new Set();
 const originalRenderCache = new Map();
+const nativeRenderCache = new Map();
 
 function clone(value) {
     return JSON.parse(JSON.stringify(value));
@@ -828,6 +829,74 @@ function applyHtmlTranslationPlan(plan, translatedSegments = []) {
     return output;
 }
 
+function createTranslatedHtmlLayoutGuard() {
+    return `<style data-stft-layout-guard>
+@media (max-width: 900px) {
+    body[data-stft-layout-guard-ready="row-flex"] {
+        align-items: flex-start !important;
+        align-content: flex-start !important;
+    }
+    body[data-stft-layout-guard-ready="column-flex"] {
+        justify-content: flex-start !important;
+        align-content: flex-start !important;
+    }
+    body[data-stft-layout-guard-ready="grid"] {
+        align-items: start !important;
+        align-content: start !important;
+    }
+}
+</style>
+<script data-stft-layout-guard>
+(function () {
+    function applyGuard() {
+        var body = document.body;
+        if (!body || !window.matchMedia || !window.matchMedia('(max-width: 900px)').matches) return;
+        var style = window.getComputedStyle ? window.getComputedStyle(body) : null;
+        if (!style) return;
+        var display = String(style.display || '');
+        if (display.indexOf('flex') !== -1) {
+            var direction = String(style.flexDirection || 'row');
+            if (direction.indexOf('column') === 0) {
+                body.setAttribute('data-stft-layout-guard-ready', 'column-flex');
+                body.style.setProperty('justify-content', 'flex-start', 'important');
+            } else {
+                body.setAttribute('data-stft-layout-guard-ready', 'row-flex');
+                body.style.setProperty('align-items', 'flex-start', 'important');
+            }
+            body.style.setProperty('align-content', 'flex-start', 'important');
+            return;
+        }
+        if (display.indexOf('grid') !== -1) {
+            body.setAttribute('data-stft-layout-guard-ready', 'grid');
+            body.style.setProperty('align-items', 'start', 'important');
+            body.style.setProperty('align-content', 'start', 'important');
+        }
+    }
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyGuard);
+    else applyGuard();
+    window.setTimeout(applyGuard, 80);
+    window.setTimeout(applyGuard, 400);
+})();
+<\/script>`;
+}
+
+function injectTranslatedHtmlLayoutGuard(htmlSource) {
+    const source = String(htmlSource ?? '');
+    if (!source || /data-stft-layout-guard/i.test(source)) return source;
+    const guard = createTranslatedHtmlLayoutGuard();
+    if (/<\/head\s*>/i.test(source)) {
+        return source.replace(/<\/head\s*>/i, `${guard}\n</head>`);
+    }
+    if (/<body(?:\s|>)/i.test(source)) {
+        return source.replace(/<body\b[^>]*>/i, match => `${match}\n${guard}`);
+    }
+    return `${guard}\n${source}`;
+}
+
+function stabilizeTranslatedHtmlLayout(displayText) {
+    return String(displayText ?? '');
+}
+
 function makeHtmlTranslationResult(plan, translatedSegments, targetLanguage, raw = '', usedFallback = false) {
     const htmlText = applyHtmlTranslationPlan(plan, translatedSegments);
     const missingTranslationCount = translatedSegments.filter(segment => !String(segment.translation ?? '').trim()).length;
@@ -1155,7 +1224,8 @@ ${content}
 }
 
 function renderHtmlIframeDocument(htmlSource, variant = 'translation') {
-    const source = String(htmlSource ?? '').trim();
+    const rawSource = String(htmlSource ?? '');
+    const source = (variant === 'translation' ? stabilizeTranslatedHtmlLayout(rawSource) : rawSource).trim();
     if (!source) return '';
     const srcdoc = createTranslatorFrameSrcdoc(source);
     return `<div class="stft-html-frame-wrap stft-html-frame-${escapeHtml(variant)}">
@@ -1268,11 +1338,10 @@ function getReplaceText(originalText, version) {
 function buildHtmlNativeDisplayText(originalText, version, mode) {
     const translatedText = String(getHtmlDocumentVersionText(version, originalText) || '').trim();
     if (!translatedText) return '';
-    if (mode === displayModes.replace) return translatedText;
-
-    const sourceText = String(originalText ?? '').trim();
-    if (!sourceText) return translatedText;
-    return `${sourceText}\n\n---\n\n${translatedText}`;
+    // Full-page HTML beautifications are rendered by Tavern Helper as iframe
+    // apps. Rendering original + translation at the same time creates two full
+    // documents and can trigger a height feedback loop on mobile WebViews.
+    return stabilizeTranslatedHtmlLayout(translatedText);
 }
 
 function renderReplaceHtml(originalText, version, messageId) {
@@ -1307,7 +1376,6 @@ function emitNativeMessageRendered(messageId) {
     const eventName = message.is_user ? event_types.USER_MESSAGE_RENDERED : event_types.CHARACTER_MESSAGE_RENDERED;
     try {
         void eventSource.emit(eventName, Number(messageId), 'floor_translator');
-        void eventSource.emit(event_types.MESSAGE_UPDATED, Number(messageId));
     } catch (error) {
         console.warn('[Floor Translator] message rendered event failed', error);
     }
@@ -1463,6 +1531,10 @@ function restoreNativeMessageDisplay(messageId, hasTranslation, renderKey) {
 function applyNativeHtmlDocumentDisplay(messageId, displayText, hasTranslation, visible, renderKey) {
     if (!String(displayText ?? '').trim()) return false;
     if (!rerenderNativeMessageWithDisplayText(messageId, displayText)) return false;
+    nativeRenderCache.set(getMessageRecordKey(messageId), {
+        renderKey,
+        appliedAt: Date.now(),
+    });
 
     const addToggle = () => {
         const $freshText = getMessageElement(messageId).find('.mes_text').first();
@@ -1473,6 +1545,16 @@ function applyNativeHtmlDocumentDisplay(messageId, displayText, hasTranslation, 
     setTimeout(addToggle, 0);
     setTimeout(addToggle, 180);
     setTimeout(addToggle, 560);
+    return true;
+}
+
+function isRecentlyAppliedNativeRender(recordKey, renderKey) {
+    const cached = nativeRenderCache.get(recordKey);
+    if (!cached || cached.renderKey !== renderKey) return false;
+    if (Date.now() - cached.appliedAt > 5000) {
+        nativeRenderCache.delete(recordKey);
+        return false;
+    }
     return true;
 }
 
@@ -1509,6 +1591,13 @@ function applyDisplay(messageId) {
         return;
     }
 
+    if (htmlVersion && isRecentlyAppliedNativeRender(recordKey, renderKey)) {
+        prependInlineToggleIfNeeded(messageId, $text, true, true);
+        $text.attr('data-stft-render-key', renderKey);
+        updateButtonState($mes);
+        return;
+    }
+
     if (htmlVersion) {
         const displayText = buildHtmlNativeDisplayText(message.mes, version, mode);
         if (applyNativeHtmlDocumentDisplay(messageId, displayText, true, true, renderKey)) {
@@ -1537,6 +1626,7 @@ function restoreDisplay(messageId, updateRecord = true) {
     const $mes = getMessageElement(messageId);
     const message = getMessageData(messageId);
     const $text = $mes.find('.mes_text').first();
+    nativeRenderCache.delete(getMessageRecordKey(messageId));
     if ($text.length && message) {
         const record = loadStore().messages[getMessageRecordKey(messageId)];
         const hasTranslation = hasDisplayableVersion(record);
