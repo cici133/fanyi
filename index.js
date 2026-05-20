@@ -11,6 +11,7 @@ const LEGACY_TOGGLE_CLASS = 'stft-toggle-button';
 const LEGACY_PANEL_CLASS = 'stft-panel-button';
 const ACTIVE_CLASS = 'stft-button-active';
 const LOADING_CLASS = 'stft-button-loading';
+const DISPLAY_RENDER_REVISION = 'html-iframe-text-v2';
 
 const displayModes = {
     replace: 'replace',
@@ -1274,7 +1275,7 @@ function getTextRenderKey(messageId, mode, version = null) {
     const versionStamp = version
         ? `${version.id || ''}:${version.editedAt || version.createdAt || ''}:${hashText(version.text || JSON.stringify(version.segments || []))}`
         : '';
-    return `${getMessageRecordKey(messageId)}:${mode}:${versionStamp}`;
+    return `${DISPLAY_RENDER_REVISION}:${getMessageRecordKey(messageId)}:${mode}:${versionStamp}`;
 }
 
 function renderInlineToggleButton(messageId, visible = false) {
@@ -1463,6 +1464,132 @@ function applyNativeHtmlDocumentDisplay(messageId, displayText, hasTranslation, 
     return true;
 }
 
+function normalizeHtmlTextForMatch(value) {
+    return decodeHtmlEntities(String(value ?? ''))
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function findRenderedHtmlIframe($text) {
+    const frames = $text.find('.TH-render iframe').toArray();
+    for (const iframe of frames) {
+        try {
+            if (iframe.contentDocument?.body) return iframe;
+        } catch {
+            // Ignore inaccessible frames and try the next rendered block.
+        }
+    }
+    return null;
+}
+
+function shouldTranslateRenderedIframeTextNode(node) {
+    const value = String(node?.nodeValue ?? '');
+    const text = value.trim();
+    if (!text) return false;
+    if (!/[\p{L}\p{N}]/u.test(text)) return false;
+    const parent = node.parentElement;
+    if (!parent) return false;
+    if (parent.closest('script, style, code, pre, kbd, samp, textarea, svg, canvas, noscript')) return false;
+    return true;
+}
+
+function buildHtmlSegmentQueues(version) {
+    const queues = new Map();
+    for (const segment of getHtmlVersionSegments(version)) {
+        const sourceKey = normalizeHtmlTextForMatch(segment.source);
+        const translation = String(segment.translation ?? segment.text ?? '').trim();
+        if (!sourceKey || !translation) continue;
+        if (!queues.has(sourceKey)) queues.set(sourceKey, []);
+        queues.get(sourceKey).push(translation);
+    }
+    return queues;
+}
+
+function applyHtmlSegmentsToRenderedIframe(iframe, version, renderKey) {
+    const queues = buildHtmlSegmentQueues(version);
+    if (!queues.size) return false;
+
+    let doc;
+    try {
+        doc = iframe.contentDocument;
+    } catch {
+        return false;
+    }
+    if (!doc?.body) return false;
+
+    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+            return shouldTranslateRenderedIframeTextNode(node)
+                ? NodeFilter.FILTER_ACCEPT
+                : NodeFilter.FILTER_REJECT;
+        },
+    });
+
+    let changed = false;
+    let node;
+    while ((node = walker.nextNode())) {
+        const raw = String(node.nodeValue ?? '');
+        const leading = raw.match(/^\s*/)?.[0] ?? '';
+        const trailing = raw.match(/\s*$/)?.[0] ?? '';
+        const core = raw.slice(leading.length, raw.length - trailing.length);
+        const key = normalizeHtmlTextForMatch(core);
+        const queue = queues.get(key);
+        const translation = queue?.shift();
+        if (!translation) continue;
+        node.nodeValue = `${leading}${translation}${trailing}`;
+        changed = true;
+    }
+
+    if (!changed) return false;
+    iframe.dataset.stftTranslationKey = renderKey;
+    try {
+        iframe.contentWindow?.dispatchEvent(new Event('resize'));
+    } catch {
+        // Height observers in Tavern Helper may not accept synthetic resize in every WebView.
+    }
+    return true;
+}
+
+function hasRenderedIframeTranslation($text, renderKey) {
+    return $text.find('.TH-render iframe').toArray().some(iframe => iframe.dataset?.stftTranslationKey === renderKey);
+}
+
+function scheduleRenderedHtmlRetry(messageId, renderKey) {
+    scheduleNativeMessageRendered(messageId);
+    setTimeout(() => {
+        const { record } = getMessageRecord(messageId);
+        const version = getSelectedVersion(record);
+        const mode = record.displayMode || version?.displayMode || settings.displayMode;
+        const currentRenderKey = getTextRenderKey(messageId, mode, version);
+        if (!record.visible || currentRenderKey !== renderKey) return;
+        const $text = getMessageElement(messageId).find('.mes_text').first();
+        if (!$text.length || hasRenderedIframeTranslation($text, renderKey)) return;
+        $text.removeAttr('data-stft-render-key');
+        applyDisplay(messageId);
+    }, 260);
+}
+
+function applyRenderedHtmlDocumentDisplay(messageId, version, renderKey) {
+    const $text = getMessageElement(messageId).find('.mes_text').first();
+    if (!$text.length) return false;
+    if (hasRenderedIframeTranslation($text, renderKey)) {
+        prependInlineToggleIfNeeded(messageId, $text, true, true);
+        $text.attr('data-stft-render-key', renderKey);
+        return true;
+    }
+
+    const iframe = findRenderedHtmlIframe($text);
+    if (!iframe) {
+        scheduleRenderedHtmlRetry(messageId, renderKey);
+        return true;
+    }
+
+    if (!applyHtmlSegmentsToRenderedIframe(iframe, version, renderKey)) return false;
+    prependInlineToggleIfNeeded(messageId, $text, true, true);
+    $text.attr('data-stft-render-key', renderKey);
+    return true;
+}
+
 function applyDisplay(messageId) {
     const $mes = getMessageElement(messageId);
     if (!$mes.length) return;
@@ -1492,11 +1619,24 @@ function applyDisplay(messageId) {
     const renderKey = getTextRenderKey(messageId, mode, version);
     const htmlVersion = isHtmlDocumentVersion(version);
     if ($text.attr('data-stft-render-key') === renderKey) {
+        if (htmlVersion && !hasRenderedIframeTranslation($text, renderKey)) {
+            $text.removeAttr('data-stft-render-key');
+        } else {
         updateButtonState($mes);
         return;
+        }
     }
 
     if (htmlVersion) {
+        const htmlSegments = getHtmlVersionSegments(version);
+        if (htmlSegments.length && applyRenderedHtmlDocumentDisplay(messageId, version, renderKey)) {
+            updateButtonState(getMessageElement(messageId));
+            return;
+        }
+        if (htmlSegments.length) {
+            updateButtonState(getMessageElement(messageId));
+            return;
+        }
         const displayText = buildHtmlNativeDisplayText(message.mes, version, mode);
         if (applyNativeHtmlDocumentDisplay(messageId, displayText, true, true, renderKey)) {
             updateButtonState(getMessageElement(messageId));
