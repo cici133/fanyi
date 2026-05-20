@@ -513,6 +513,37 @@ function getHtmlFenceCloser(match) {
     return match?.[4] ?? '';
 }
 
+function matchWholeFence(text) {
+    return String(text ?? '').trim().match(/^(`{3,})[^\r\n]*\r?\n([\s\S]*?)(\r?\n?\1)$/);
+}
+
+function unwrapHtmlFenceBody(body) {
+    let current = String(body ?? '');
+    const wrappers = [];
+
+    for (let depth = 0; depth < 6; depth += 1) {
+        const trimmed = current.trim();
+        if (looksLikeStandaloneHtml(trimmed)) {
+            return {
+                html: trimmed,
+                prefix: wrappers.map(wrapper => wrapper.opener).join(''),
+                suffix: wrappers.slice().reverse().map(wrapper => wrapper.closer).join(''),
+            };
+        }
+
+        const nested = matchWholeFence(trimmed);
+        if (!nested) break;
+        const openerLength = trimmed.length - nested[2].length - nested[3].length;
+        wrappers.push({
+            opener: trimmed.slice(0, openerLength),
+            closer: nested[3],
+        });
+        current = nested[2];
+    }
+
+    return null;
+}
+
 function looksLikeStandaloneHtml(value) {
     const text = String(value ?? '').trim();
     return /^<!doctype\s+html/i.test(text)
@@ -520,18 +551,25 @@ function looksLikeStandaloneHtml(value) {
         || (/<body[\s>]/i.test(text) && /<\/body>/i.test(text));
 }
 
+function containsLikelyHtmlDocument(value) {
+    const text = String(value ?? '');
+    return /<!doctype\s+html/i.test(text)
+        || /<html[\s>]/i.test(text)
+        || (/<body[\s>]/i.test(text) && /<\/body>/i.test(text));
+}
+
 function looksLikeHtmlDocumentSource(value) {
     const text = String(value ?? '').trim();
     if (!text) return false;
     if (looksLikeStandaloneHtml(text)) return true;
-    const singleFence = text.match(/^(`{3,})[^\r\n]*\r?\n([\s\S]*?)\r?\n?\1$/);
-    if (singleFence && looksLikeStandaloneHtml(singleFence[2])) return true;
+    const singleFence = matchWholeFence(text);
+    if (singleFence && unwrapHtmlFenceBody(singleFence[2])) return true;
     const fencedRegex = createHtmlFenceRegex();
     let match;
     while ((match = fencedRegex.exec(text))) {
-        if (looksLikeStandaloneHtml(getHtmlFenceBody(match))) return true;
+        if (unwrapHtmlFenceBody(getHtmlFenceBody(match))) return true;
     }
-    return false;
+    return containsLikelyHtmlDocument(text);
 }
 
 function shouldTranslateHtmlTextNode(node) {
@@ -706,15 +744,17 @@ function createHtmlTranslationPlan(sourceText) {
     let match;
 
     while ((match = fencedRegex.exec(source))) {
-        const htmlBody = getHtmlFenceBody(match);
-        if (!looksLikeStandaloneHtml(htmlBody)) continue;
-        const blockState = createHtmlBlockState(htmlBody);
+        const extracted = unwrapHtmlFenceBody(getHtmlFenceBody(match));
+        if (!extracted) continue;
+        const blockState = createHtmlBlockState(extracted.html);
         if (!blockState) continue;
         blocks.push({
             start: match.index,
             end: match.index + match[0].length,
             opener: match[1],
             closer: getHtmlFenceCloser(match),
+            bodyPrefix: extracted.prefix,
+            bodySuffix: extracted.suffix,
             state: blockState,
         });
         for (const textNode of blockState.textNodes) {
@@ -781,7 +821,7 @@ function applyHtmlTranslationPlan(plan, translatedSegments = []) {
     let cursor = 0;
     for (const block of plan.blocks) {
         output += plan.source.slice(cursor, block.start);
-        output += `${block.opener}${serializeHtmlBlockState(block.state)}${block.closer}`;
+        output += `${block.opener}${block.bodyPrefix || ''}${serializeHtmlBlockState(block.state)}${block.bodySuffix || ''}${block.closer}`;
         cursor = block.end;
     }
     output += plan.source.slice(cursor);
@@ -989,8 +1029,8 @@ function extractFirstHtmlDocumentSource(text) {
     const fencedRegex = createHtmlFenceRegex();
     let match;
     while ((match = fencedRegex.exec(source))) {
-        const body = getHtmlFenceBody(match);
-        if (looksLikeStandaloneHtml(body)) return body.trim();
+        const extracted = unwrapHtmlFenceBody(getHtmlFenceBody(match));
+        if (extracted?.html) return extracted.html;
     }
     return looksLikeStandaloneHtml(source) ? source.trim() : '';
 }
