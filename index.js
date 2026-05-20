@@ -1035,11 +1035,129 @@ function extractFirstHtmlDocumentSource(text) {
     return looksLikeStandaloneHtml(source) ? source.trim() : '';
 }
 
+function replaceFrameVhInContent(content) {
+    let text = String(content ?? '');
+    const hasCssMinVh = /min-height\s*:\s*[^;{}]*\d+(?:\.\d+)?vh/gi.test(text);
+    const hasInlineStyleVh = /style\s*=\s*(["'])[\s\S]*?min-height\s*:\s*[^;]*?\d+(?:\.\d+)?vh[\s\S]*?\1/gi.test(text);
+    const hasJsVh = /(\.style\.minHeight\s*=\s*(["']))([\s\S]*?vh)(\2)/gi.test(text)
+        || /(setProperty\s*\(\s*(["'])min-height\2\s*,\s*(["']))([\s\S]*?vh)(\3\s*\))/gi.test(text);
+
+    if (!hasCssMinVh && !hasInlineStyleVh && !hasJsVh) return text;
+
+    const convertVhToVariable = value => String(value).replace(/(\d+(?:\.\d+)?)vh\b/gi, (match, rawValue) => {
+        const parsed = Number.parseFloat(rawValue);
+        if (!Number.isFinite(parsed)) return match;
+        const variable = 'var(--TH-viewport-height)';
+        return parsed === 100 ? variable : `calc(${variable} * ${parsed / 100})`;
+    });
+
+    text = text.replace(
+        /(min-height\s*:\s*)([^;{}]*?\d+(?:\.\d+)?vh)(?=\s*[;}])/gi,
+        (_match, prefix, value) => `${prefix}${convertVhToVariable(value)}`,
+    );
+
+    text = text.replace(
+        /(style\s*=\s*(["']))([^"'"]*?)(\2)/gi,
+        (match, prefix, _quote, styleContent, suffix) => {
+            if (!/min-height\s*:\s*[^;]*vh/i.test(styleContent)) return match;
+            const replaced = styleContent.replace(
+                /(min-height\s*:\s*)([^;]*?\d+(?:\.\d+)?vh)/gi,
+                (_innerMatch, p1, p2) => `${p1}${convertVhToVariable(p2)}`,
+            );
+            return `${prefix}${replaced}${suffix}`;
+        },
+    );
+
+    text = text.replace(
+        /(\.style\.minHeight\s*=\s*(["']))([\s\S]*?)(\2)/gi,
+        (match, prefix, _quote, value, suffix) => {
+            if (!/\b\d+(?:\.\d+)?vh\b/i.test(value)) return match;
+            return `${prefix}${convertVhToVariable(value)}${suffix}`;
+        },
+    );
+
+    text = text.replace(
+        /(setProperty\s*\(\s*(["'])min-height\2\s*,\s*(["']))([\s\S]*?)(\3\s*\))/gi,
+        (match, prefix, _quote1, _quote2, value, suffix) => {
+            if (!/\b\d+(?:\.\d+)?vh\b/i.test(value)) return match;
+            return `${prefix}${convertVhToVariable(value)}${suffix}`;
+        },
+    );
+
+    return text;
+}
+
+function createTranslatorFrameSrcdoc(htmlSource) {
+    const content = replaceFrameVhInContent(htmlSource);
+    const frameScript = `
+<script>
+(function () {
+    var resizeTimer = 0;
+    function setViewportHeight() {
+        var height = 0;
+        try {
+            height = window.parent && window.parent.innerHeight ? window.parent.innerHeight : 0;
+        } catch (_error) {}
+        if (!height) height = window.innerHeight || document.documentElement.clientHeight || 0;
+        if (height) document.documentElement.style.setProperty('--TH-viewport-height', height + 'px');
+    }
+    function measure() {
+        var body = document.body;
+        var html = document.documentElement;
+        if (!body || !html || !window.frameElement) return;
+        var height = Math.max(body.scrollHeight || 0, html.scrollHeight || 0, body.offsetHeight || 0, 160);
+        window.frameElement.style.height = Math.min(height + 2, 6000) + 'px';
+    }
+    function schedule() {
+        if (resizeTimer) window.clearTimeout(resizeTimer);
+        setViewportHeight();
+        window.requestAnimationFrame(function () {
+            measure();
+            resizeTimer = window.setTimeout(measure, 80);
+        });
+    }
+    window.addEventListener('load', schedule);
+    window.addEventListener('resize', schedule);
+    if (typeof ResizeObserver !== 'undefined') {
+        window.addEventListener('DOMContentLoaded', function () {
+            try {
+                var observer = new ResizeObserver(schedule);
+                observer.observe(document.documentElement);
+                if (document.body) observer.observe(document.body);
+            } catch (_error) {}
+        });
+    }
+    setViewportHeight();
+    window.setTimeout(schedule, 0);
+    window.setTimeout(schedule, 160);
+    window.setTimeout(schedule, 650);
+})();
+<\/script>`;
+
+    return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<base href="${escapeHtml(window.location.origin)}/">
+<style>
+*,*::before,*::after{box-sizing:border-box;}
+html,body{margin:0!important;padding:0;overflow:hidden!important;max-width:100%!important;}
+</style>
+${frameScript}
+</head>
+<body>
+${content}
+</body>
+</html>`;
+}
+
 function renderHtmlIframeDocument(htmlSource, variant = 'translation') {
     const source = String(htmlSource ?? '').trim();
     if (!source) return '';
+    const srcdoc = createTranslatorFrameSrcdoc(source);
     return `<div class="stft-html-frame-wrap stft-html-frame-${escapeHtml(variant)}">
-        <iframe class="stft-html-frame" loading="lazy" referrerpolicy="no-referrer" srcdoc="${escapeHtml(source)}"></iframe>
+        <iframe class="stft-html-frame" loading="lazy" referrerpolicy="no-referrer" srcdoc="${escapeHtml(srcdoc)}"></iframe>
     </div>`;
 }
 
