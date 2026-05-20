@@ -996,6 +996,34 @@ function getHtmlVersionSegments(version) {
     return [];
 }
 
+function getStoredHtmlDocumentText(version) {
+    const text = String(version?.text ?? '').trim();
+    if (text) return version.text;
+    const documentSegment = version?.segments?.find(segment => segment.kind === 'html_document');
+    if (String(documentSegment?.translation ?? '').trim()) return documentSegment.translation;
+    if (String(version?.segments?.[0]?.translation ?? '').trim()) return version.segments[0].translation;
+    return '';
+}
+
+function getEffectiveHtmlVersionSegments(version, originalText = '') {
+    const existing = getHtmlVersionSegments(version);
+    if (existing.length) return existing;
+
+    const translatedText = getStoredHtmlDocumentText(version);
+    if (!translatedText || !looksLikeHtmlDocumentSource(translatedText)) return [];
+    const originalPlan = createHtmlTranslationPlan(originalText);
+    const translatedPlan = createHtmlTranslationPlan(translatedText);
+    if (!originalPlan?.segments?.length || !translatedPlan?.segments?.length) return [];
+    if (originalPlan.segments.length !== translatedPlan.segments.length) return [];
+
+    return originalPlan.segments.map((segment, index) => ({
+        id: segment.id,
+        source: segment.source,
+        translation: translatedPlan.segments[index]?.source || '',
+        kind: 'html_text_node',
+    }));
+}
+
 function applyTranslationsToRenderedHtml(html, htmlSegments) {
     const wrapper = document.createElement('div');
     wrapper.innerHTML = stripPluginChromeHtml(html);
@@ -1205,12 +1233,7 @@ function getHtmlDocumentVersionText(version, originalText = '') {
         }
     }
 
-    const text = String(version?.text ?? '').trim();
-    if (text) return version.text;
-    const documentSegment = version?.segments?.find(segment => segment.kind === 'html_document');
-    if (String(documentSegment?.translation ?? '').trim()) return documentSegment.translation;
-    if (String(version?.segments?.[0]?.translation ?? '').trim()) return version.segments[0].translation;
-    return '';
+    return getStoredHtmlDocumentText(version);
 }
 
 function renderHtmlDocumentVersion(messageId, version) {
@@ -1493,9 +1516,9 @@ function shouldTranslateRenderedIframeTextNode(node) {
     return true;
 }
 
-function buildHtmlSegmentQueues(version) {
+function buildHtmlSegmentQueues(htmlSegments) {
     const queues = new Map();
-    for (const segment of getHtmlVersionSegments(version)) {
+    for (const segment of htmlSegments || []) {
         const sourceKey = normalizeHtmlTextForMatch(segment.source);
         const translation = String(segment.translation ?? segment.text ?? '').trim();
         if (!sourceKey || !translation) continue;
@@ -1505,8 +1528,51 @@ function buildHtmlSegmentQueues(version) {
     return queues;
 }
 
-function applyHtmlSegmentsToRenderedIframe(iframe, version, renderKey) {
-    const queues = buildHtmlSegmentQueues(version);
+function stabilizeTranslatedIframeLayout(iframe) {
+    let doc;
+    try {
+        doc = iframe.contentDocument;
+    } catch {
+        return;
+    }
+    if (!doc?.documentElement || !doc.body) return;
+
+    let style = doc.getElementById('stft-translated-layout-fix');
+    if (!style) {
+        style = doc.createElement('style');
+        style.id = 'stft-translated-layout-fix';
+        (doc.head || doc.documentElement).appendChild(style);
+    }
+    style.textContent = `
+html,
+body {
+    min-height: 0 !important;
+    height: auto !important;
+}
+`;
+}
+
+function resizeTranslatedIframe(iframe) {
+    try {
+        const doc = iframe.contentDocument;
+        if (!doc?.body) return;
+        const rectHeight = doc.body.getBoundingClientRect?.().height || 0;
+        const height = Math.max(doc.body.scrollHeight || 0, doc.body.offsetHeight || 0, rectHeight || 0, 160);
+        if (!Number.isFinite(height) || height <= 0) return;
+        iframe.style.height = `${Math.min(Math.ceil(height + 2), 6000)}px`;
+    } catch {
+        // Keep Tavern Helper's own height if direct measurement is blocked.
+    }
+}
+
+function scheduleTranslatedIframeResize(iframe) {
+    resizeTranslatedIframe(iframe);
+    setTimeout(() => resizeTranslatedIframe(iframe), 80);
+    setTimeout(() => resizeTranslatedIframe(iframe), 260);
+}
+
+function applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey) {
+    const queues = buildHtmlSegmentQueues(htmlSegments);
     if (!queues.size) return false;
 
     let doc;
@@ -1541,12 +1607,9 @@ function applyHtmlSegmentsToRenderedIframe(iframe, version, renderKey) {
     }
 
     if (!changed) return false;
+    stabilizeTranslatedIframeLayout(iframe);
     iframe.dataset.stftTranslationKey = renderKey;
-    try {
-        iframe.contentWindow?.dispatchEvent(new Event('resize'));
-    } catch {
-        // Height observers in Tavern Helper may not accept synthetic resize in every WebView.
-    }
+    scheduleTranslatedIframeResize(iframe);
     return true;
 }
 
@@ -1569,7 +1632,7 @@ function scheduleRenderedHtmlRetry(messageId, renderKey) {
     }, 260);
 }
 
-function applyRenderedHtmlDocumentDisplay(messageId, version, renderKey) {
+function applyRenderedHtmlDocumentDisplay(messageId, htmlSegments, renderKey) {
     const $text = getMessageElement(messageId).find('.mes_text').first();
     if (!$text.length) return false;
     if (hasRenderedIframeTranslation($text, renderKey)) {
@@ -1584,7 +1647,7 @@ function applyRenderedHtmlDocumentDisplay(messageId, version, renderKey) {
         return true;
     }
 
-    if (!applyHtmlSegmentsToRenderedIframe(iframe, version, renderKey)) return false;
+    if (!applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey)) return false;
     prependInlineToggleIfNeeded(messageId, $text, true, true);
     $text.attr('data-stft-render-key', renderKey);
     return true;
@@ -1628,8 +1691,8 @@ function applyDisplay(messageId) {
     }
 
     if (htmlVersion) {
-        const htmlSegments = getHtmlVersionSegments(version);
-        if (htmlSegments.length && applyRenderedHtmlDocumentDisplay(messageId, version, renderKey)) {
+        const htmlSegments = getEffectiveHtmlVersionSegments(version, message.mes);
+        if (htmlSegments.length && applyRenderedHtmlDocumentDisplay(messageId, htmlSegments, renderKey)) {
             updateButtonState(getMessageElement(messageId));
             return;
         }
