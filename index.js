@@ -1861,17 +1861,15 @@ function applyDisplay(messageId) {
         }
     }
 
-    if (htmlVersion) {
+    if (htmlVersion && !mixedHtmlVersion) {
         const htmlSegments = getEffectiveHtmlVersionSegments(version, message.mes);
-        if (!mixedHtmlVersion) {
-            if (htmlSegments.length && applyRenderedHtmlDocumentDisplay(messageId, htmlSegments, renderKey)) {
-                updateButtonState(getMessageElement(messageId));
-                return;
-            }
-            if (htmlSegments.length) {
-                updateButtonState(getMessageElement(messageId));
-                return;
-            }
+        if (htmlSegments.length && applyRenderedHtmlDocumentDisplay(messageId, htmlSegments, renderKey)) {
+            updateButtonState(getMessageElement(messageId));
+            return;
+        }
+        if (htmlSegments.length) {
+            updateButtonState(getMessageElement(messageId));
+            return;
         }
         const displayText = buildHtmlNativeDisplayText(message.mes, version, mode);
         if (applyNativeHtmlDocumentDisplay(messageId, displayText, true, true, renderKey)) {
