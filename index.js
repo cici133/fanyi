@@ -1037,14 +1037,15 @@ function extractFirstHtmlDocumentSource(text) {
 
 function replaceFrameVhInContent(content) {
     let text = String(content ?? '');
-    const hasCssMinVh = /min-height\s*:\s*[^;{}]*\d+(?:\.\d+)?vh/gi.test(text);
-    const hasInlineStyleVh = /style\s*=\s*(["'])[\s\S]*?min-height\s*:\s*[^;]*?\d+(?:\.\d+)?vh[\s\S]*?\1/gi.test(text);
-    const hasJsVh = /(\.style\.minHeight\s*=\s*(["']))([\s\S]*?vh)(\2)/gi.test(text)
-        || /(setProperty\s*\(\s*(["'])min-height\2\s*,\s*(["']))([\s\S]*?vh)(\3\s*\))/gi.test(text);
+    const vhUnitPattern = '\\d+(?:\\.\\d+)?(?:dvh|svh|lvh|vh)';
+    const hasCssVh = new RegExp(`(?:min-height|height)\\s*:\\s*[^;{}]*${vhUnitPattern}`, 'gi').test(text);
+    const hasInlineStyleVh = new RegExp(`style\\s*=\\s*(["'])[\\s\\S]*?(?:min-height|height)\\s*:\\s*[^;]*?${vhUnitPattern}[\\s\\S]*?\\1`, 'gi').test(text);
+    const hasJsVh = /(\.style\.(?:minHeight|height)\s*=\s*(["']))([\s\S]*?(?:dvh|svh|lvh|vh))(\2)/gi.test(text)
+        || /(setProperty\s*\(\s*(["'])(?:min-height|height)\2\s*,\s*(["']))([\s\S]*?(?:dvh|svh|lvh|vh))(\3\s*\))/gi.test(text);
 
-    if (!hasCssMinVh && !hasInlineStyleVh && !hasJsVh) return text;
+    if (!hasCssVh && !hasInlineStyleVh && !hasJsVh) return text;
 
-    const convertVhToVariable = value => String(value).replace(/(\d+(?:\.\d+)?)vh\b/gi, (match, rawValue) => {
+    const convertVhToVariable = value => String(value).replace(/(\d+(?:\.\d+)?)(?:dvh|svh|lvh|vh)\b/gi, (match, rawValue) => {
         const parsed = Number.parseFloat(rawValue);
         if (!Number.isFinite(parsed)) return match;
         const variable = 'var(--TH-viewport-height)';
@@ -1052,16 +1053,16 @@ function replaceFrameVhInContent(content) {
     });
 
     text = text.replace(
-        /(min-height\s*:\s*)([^;{}]*?\d+(?:\.\d+)?vh)(?=\s*[;}])/gi,
+        /((?:min-height|height)\s*:\s*)([^;{}]*\d+(?:\.\d+)?(?:dvh|svh|lvh|vh)[^;{}]*)(?=\s*[;}])/gi,
         (_match, prefix, value) => `${prefix}${convertVhToVariable(value)}`,
     );
 
     text = text.replace(
         /(style\s*=\s*(["']))([^"'"]*?)(\2)/gi,
         (match, prefix, _quote, styleContent, suffix) => {
-            if (!/min-height\s*:\s*[^;]*vh/i.test(styleContent)) return match;
+            if (!/(?:min-height|height)\s*:\s*[^;]*(?:dvh|svh|lvh|vh)/i.test(styleContent)) return match;
             const replaced = styleContent.replace(
-                /(min-height\s*:\s*)([^;]*?\d+(?:\.\d+)?vh)/gi,
+                /((?:min-height|height)\s*:\s*)([^;]*\d+(?:\.\d+)?(?:dvh|svh|lvh|vh)[^;]*)/gi,
                 (_innerMatch, p1, p2) => `${p1}${convertVhToVariable(p2)}`,
             );
             return `${prefix}${replaced}${suffix}`;
@@ -1069,17 +1070,17 @@ function replaceFrameVhInContent(content) {
     );
 
     text = text.replace(
-        /(\.style\.minHeight\s*=\s*(["']))([\s\S]*?)(\2)/gi,
+        /(\.style\.(?:minHeight|height)\s*=\s*(["']))([\s\S]*?)(\2)/gi,
         (match, prefix, _quote, value, suffix) => {
-            if (!/\b\d+(?:\.\d+)?vh\b/i.test(value)) return match;
+            if (!/\b\d+(?:\.\d+)?(?:dvh|svh|lvh|vh)\b/i.test(value)) return match;
             return `${prefix}${convertVhToVariable(value)}${suffix}`;
         },
     );
 
     text = text.replace(
-        /(setProperty\s*\(\s*(["'])min-height\2\s*,\s*(["']))([\s\S]*?)(\3\s*\))/gi,
+        /(setProperty\s*\(\s*(["'])(?:min-height|height)\2\s*,\s*(["']))([\s\S]*?)(\3\s*\))/gi,
         (match, prefix, _quote1, _quote2, value, suffix) => {
-            if (!/\b\d+(?:\.\d+)?vh\b/i.test(value)) return match;
+            if (!/\b\d+(?:\.\d+)?(?:dvh|svh|lvh|vh)\b/i.test(value)) return match;
             return `${prefix}${convertVhToVariable(value)}${suffix}`;
         },
     );
@@ -1103,9 +1104,10 @@ function createTranslatorFrameSrcdoc(htmlSource) {
     }
     function measure() {
         var body = document.body;
-        var html = document.documentElement;
-        if (!body || !html || !window.frameElement) return;
-        var height = Math.max(body.scrollHeight || 0, html.scrollHeight || 0, body.offsetHeight || 0, 160);
+        if (!body || !window.frameElement) return;
+        window.frameElement.style.height = '1px';
+        var height = body.scrollHeight || body.offsetHeight || 0;
+        if (!Number.isFinite(height) || height <= 0) return;
         window.frameElement.style.height = Math.min(height + 2, 6000) + 'px';
     }
     function schedule() {
@@ -1329,12 +1331,11 @@ function resizeFallbackIframe(iframe) {
     try {
         const doc = iframe.contentDocument;
         if (!doc) return;
-        const height = Math.max(
-            doc.body?.scrollHeight || 0,
-            doc.documentElement?.scrollHeight || 0,
-            160,
-        );
-        iframe.style.height = `${Math.min(height + 16, 6000)}px`;
+        iframe.style.height = '1px';
+        const bodyHeight = doc.body?.scrollHeight || doc.body?.offsetHeight || 0;
+        const height = bodyHeight || doc.documentElement?.scrollHeight || 160;
+        if (!Number.isFinite(height) || height <= 0) return;
+        iframe.style.height = `${Math.min(height + 2, 6000)}px`;
     } catch {
         iframe.style.height = '70vh';
     }
