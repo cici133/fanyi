@@ -111,14 +111,10 @@
     width: 100%;
 }
 
-.stft-html-code-wrap {
+.stft-html-code-source {
     display: block;
     margin: 0;
     width: 100%;
-}
-
-.stft-html-code-source {
-    margin: 0;
 }
 
 .stft-compare-pair {

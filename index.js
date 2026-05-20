@@ -1053,8 +1053,8 @@ function replaceFrameVhInContent(content) {
     });
 
     text = text.replace(
-        /((?:min-height|height)\s*:\s*)([^;{}]*\d+(?:\.\d+)?(?:dvh|svh|lvh|vh)[^;{}]*)(?=\s*[;}])/gi,
-        (_match, prefix, value) => `${prefix}${convertVhToVariable(value)}`,
+        /(^|[;{\s])((?:min-height|height)\s*:\s*)([^;{}]*\d+(?:\.\d+)?(?:dvh|svh|lvh|vh)[^;{}]*)(?=\s*[;}])/gi,
+        (_match, boundary, prefix, value) => `${boundary}${prefix}${convertVhToVariable(value)}`,
     );
 
     text = text.replace(
@@ -1156,11 +1156,9 @@ ${frameTools}`;
 }
 
 function renderHtmlIframeDocument(htmlSource, variant = 'translation') {
-    const source = String(htmlSource ?? '').trim();
+    const source = replaceFrameVhInContent(String(htmlSource ?? '').trim()).trim();
     if (!source) return '';
-    return `<div class="stft-html-code-wrap stft-html-code-${escapeHtml(variant)}">
-        <pre class="stft-html-code-source"><code class="language-html">${escapeHtml(source)}</code></pre>
-    </div>`;
+    return `<pre class="stft-html-code-source stft-html-code-${escapeHtml(variant)}"><code class="language-html">${escapeHtml(source)}</code></pre>`;
 }
 
 function bindHtmlFrameSizing(messageId) {
@@ -1262,11 +1260,7 @@ function getReplaceText(originalText, version) {
 function buildHtmlNativeDisplayText(originalText, version, mode) {
     const translatedText = String(getHtmlDocumentVersionText(version, originalText) || '').trim();
     if (!translatedText) return '';
-    if (mode === displayModes.replace) return translatedText;
-
-    const sourceText = String(originalText ?? '').trim();
-    if (!sourceText) return translatedText;
-    return `${sourceText}\n\n---\n\n${translatedText}`;
+    return replaceFrameVhInContent(translatedText);
 }
 
 function renderReplaceHtml(originalText, version, messageId) {
@@ -1454,6 +1448,8 @@ function restoreNativeMessageDisplay(messageId, hasTranslation, renderKey) {
 function applyNativeHtmlDocumentDisplay(messageId, displayText, hasTranslation, visible, renderKey) {
     if (!String(displayText ?? '').trim()) return false;
     if (!rerenderNativeMessageWithDisplayText(messageId, displayText)) return false;
+    const $text = getMessageElement(messageId).find('.mes_text').first();
+    $text.attr('data-stft-render-key', renderKey);
 
     const addToggle = () => {
         const $freshText = getMessageElement(messageId).find('.mes_text').first();
@@ -1498,6 +1494,14 @@ function applyDisplay(messageId) {
     if ($text.attr('data-stft-render-key') === renderKey) {
         updateButtonState($mes);
         return;
+    }
+
+    if (htmlVersion) {
+        const displayText = buildHtmlNativeDisplayText(message.mes, version, mode);
+        if (applyNativeHtmlDocumentDisplay(messageId, displayText, true, true, renderKey)) {
+            updateButtonState(getMessageElement(messageId));
+            return;
+        }
     }
 
     rememberOriginalRender(messageId, $text);
