@@ -713,6 +713,23 @@ function createHtmlBlockState(html) {
     }
 }
 
+function createPlainTextPlanSegment(source, start, end) {
+    if (end <= start) return null;
+    const raw = String(source ?? '').slice(start, end);
+    const leading = raw.match(/^\s*/)?.[0] ?? '';
+    const trailing = raw.match(/\s*$/)?.[0] ?? '';
+    const coreStart = start + leading.length;
+    const coreEnd = end - trailing.length;
+    const core = String(source ?? '').slice(coreStart, coreEnd);
+    if (!shouldTranslateRawHtmlText(core)) return null;
+    return {
+        start: coreStart,
+        end: coreEnd,
+        source: core,
+        kind: 'plain_text',
+    };
+}
+
 function serializeHtmlBlockState(state) {
     if (!state) return '';
     if (state.raw) {
@@ -741,7 +758,6 @@ function createHtmlTranslationPlan(sourceText) {
     const source = String(sourceText ?? '');
     const fencedRegex = createHtmlFenceRegex();
     const blocks = [];
-    const segments = [];
     let match;
 
     while ((match = fencedRegex.exec(source))) {
@@ -758,15 +774,6 @@ function createHtmlTranslationPlan(sourceText) {
             bodySuffix: extracted.suffix,
             state: blockState,
         });
-        for (const textNode of blockState.textNodes) {
-            const id = segments.length + 1;
-            textNode.segmentId = id;
-            segments.push({
-                id,
-                source: textNode.source,
-                kind: 'html_text_node',
-            });
-        }
     }
 
     if (!blocks.length && looksLikeStandaloneHtml(source)) {
@@ -782,19 +789,54 @@ function createHtmlTranslationPlan(sourceText) {
                 closer: '',
                 state: blockState,
             });
-            for (const textNode of blockState.textNodes) {
-                const id = segments.length + 1;
-                textNode.segmentId = id;
-                segments.push({
-                    id,
-                    source: textNode.source,
-                    kind: 'html_text_node',
-                });
-            }
         }
     }
 
-    return blocks.length && segments.length ? { source, blocks, segments } : null;
+    if (!blocks.length) return null;
+
+    blocks.sort((a, b) => a.start - b.start);
+    const plainSegments = [];
+    const segmentItems = [];
+
+    let cursor = 0;
+    for (const block of blocks) {
+        if (block.start > cursor) {
+            const plainSegment = createPlainTextPlanSegment(source, cursor, block.start);
+            if (plainSegment) {
+                plainSegments.push(plainSegment);
+                segmentItems.push(plainSegment);
+            }
+        }
+        for (const textNode of block.state.textNodes) {
+            segmentItems.push({
+                source: textNode.source,
+                kind: 'html_text_node',
+                textNode,
+            });
+        }
+        cursor = Math.max(cursor, block.end);
+    }
+
+    if (cursor < source.length) {
+        const plainSegment = createPlainTextPlanSegment(source, cursor, source.length);
+        if (plainSegment) {
+            plainSegments.push(plainSegment);
+            segmentItems.push(plainSegment);
+        }
+    }
+
+    const segments = segmentItems.map((item, index) => {
+        const id = index + 1;
+        item.segmentId = id;
+        if (item.textNode) item.textNode.segmentId = id;
+        return {
+            id,
+            source: item.source,
+            kind: item.kind,
+        };
+    });
+
+    return blocks.length && segments.length ? { source, blocks, plainSegments, segments } : null;
 }
 
 function applyHtmlTranslationPlan(plan, translatedSegments = []) {
@@ -818,12 +860,32 @@ function applyHtmlTranslationPlan(plan, translatedSegments = []) {
         }
     }
 
+    const replacements = [];
+    for (const plainSegment of plan.plainSegments || []) {
+        const translation = translations.get(Number(plainSegment.segmentId));
+        const translated = String(translation || '').trim();
+        replacements.push({
+            start: plainSegment.start,
+            end: plainSegment.end,
+            text: translated || plainSegment.source,
+        });
+    }
+    for (const block of plan.blocks) {
+        replacements.push({
+            start: block.start,
+            end: block.end,
+            text: `${block.opener}${block.bodyPrefix || ''}${serializeHtmlBlockState(block.state)}${block.bodySuffix || ''}${block.closer}`,
+        });
+    }
+    replacements.sort((a, b) => a.start - b.start);
+
     let output = '';
     let cursor = 0;
-    for (const block of plan.blocks) {
-        output += plan.source.slice(cursor, block.start);
-        output += `${block.opener}${block.bodyPrefix || ''}${serializeHtmlBlockState(block.state)}${block.bodySuffix || ''}${block.closer}`;
-        cursor = block.end;
+    for (const replacement of replacements) {
+        if (replacement.start < cursor) continue;
+        output += plan.source.slice(cursor, replacement.start);
+        output += replacement.text;
+        cursor = replacement.end;
     }
     output += plan.source.slice(cursor);
     return output;
@@ -832,12 +894,15 @@ function applyHtmlTranslationPlan(plan, translatedSegments = []) {
 function makeHtmlTranslationResult(plan, translatedSegments, targetLanguage, raw = '', usedFallback = false) {
     const htmlText = applyHtmlTranslationPlan(plan, translatedSegments);
     const missingTranslationCount = translatedSegments.filter(segment => !String(segment.translation ?? '').trim()).length;
-    const htmlSegments = translatedSegments.map(segment => ({
-        id: segment.id,
-        source: segment.source,
-        translation: String(segment.translation ?? '').trim(),
-        kind: segment.kind,
-    }));
+    const htmlSegments = translatedSegments
+        .filter(segment => segment.kind === 'html_text_node')
+        .map(segment => ({
+            id: segment.id,
+            source: segment.source,
+            translation: String(segment.translation ?? '').trim(),
+            kind: segment.kind,
+        }));
+    const mixedHtml = Boolean(plan.plainSegments?.length);
     return {
         text: htmlText,
         htmlSegments,
@@ -847,12 +912,14 @@ function makeHtmlTranslationResult(plan, translatedSegments, targetLanguage, raw
             translation: htmlText,
             kind: 'html_document',
             htmlSegments,
+            mixedHtml,
         }],
         raw: String(raw ?? '').trim(),
         usedFallback,
         looksUntranslated: isProbablyUntranslated(translatedSegments, targetLanguage),
         missingTranslationCount,
         htmlMode: true,
+        mixedHtml,
     };
 }
 
@@ -989,10 +1056,21 @@ function isHtmlDocumentVersion(version) {
     );
 }
 
+function isMixedHtmlDocumentVersion(version) {
+    return Boolean(
+        version?.mixedHtml
+        || version?.segments?.some(segment => segment.kind === 'html_document' && segment.mixedHtml)
+    );
+}
+
 function getHtmlVersionSegments(version) {
-    if (Array.isArray(version?.htmlSegments) && version.htmlSegments.length) return version.htmlSegments;
+    if (Array.isArray(version?.htmlSegments) && version.htmlSegments.length) {
+        return version.htmlSegments.filter(segment => !segment.kind || segment.kind === 'html_text_node');
+    }
     const documentSegment = version?.segments?.find(segment => segment.kind === 'html_document');
-    if (Array.isArray(documentSegment?.htmlSegments) && documentSegment.htmlSegments.length) return documentSegment.htmlSegments;
+    if (Array.isArray(documentSegment?.htmlSegments) && documentSegment.htmlSegments.length) {
+        return documentSegment.htmlSegments.filter(segment => !segment.kind || segment.kind === 'html_text_node');
+    }
     return [];
 }
 
@@ -1224,6 +1302,10 @@ function renderOriginalHtmlDocument(messageId) {
 }
 
 function getHtmlDocumentVersionText(version, originalText = '') {
+    if (isMixedHtmlDocumentVersion(version)) {
+        const stored = getStoredHtmlDocumentText(version);
+        if (String(stored ?? '').trim()) return stored;
+    }
     const htmlSegments = getHtmlVersionSegments(version);
     if (htmlSegments.length) {
         const plan = createHtmlTranslationPlan(originalText);
@@ -1253,7 +1335,10 @@ function renderHtmlDocumentVersion(messageId, version) {
 
 function renderCompareHtml(originalText, version, messageId) {
     if (isHtmlDocumentVersion(version)) {
-        return `<div class="stft-render stft-replace-render stft-html-document-render">${renderInlineToggleButton(messageId, true)}${renderHtmlDocumentVersion(messageId, version)}</div>`;
+        const html = isMixedHtmlDocumentVersion(version)
+            ? renderMarkdown(getHtmlDocumentVersionText(version, originalText), messageId)
+            : renderHtmlDocumentVersion(messageId, version);
+        return `<div class="stft-render stft-replace-render stft-html-document-render">${renderInlineToggleButton(messageId, true)}${html}</div>`;
     }
     const segments = normalizeVersionSegments(version, originalText);
     let html = '<div class="stft-render stft-compare-render">';
@@ -1289,7 +1374,10 @@ function buildHtmlNativeDisplayText(originalText, version, mode) {
 
 function renderReplaceHtml(originalText, version, messageId) {
     if (isHtmlDocumentVersion(version)) {
-        return `<div class="stft-render stft-replace-render stft-html-document-render">${renderInlineToggleButton(messageId, true)}${renderHtmlDocumentVersion(messageId, version)}</div>`;
+        const html = isMixedHtmlDocumentVersion(version)
+            ? renderMarkdown(getHtmlDocumentVersionText(version, originalText), messageId)
+            : renderHtmlDocumentVersion(messageId, version);
+        return `<div class="stft-render stft-replace-render stft-html-document-render">${renderInlineToggleButton(messageId, true)}${html}</div>`;
     }
     return `<div class="stft-render stft-replace-render">${renderInlineToggleButton(messageId, true)}${renderMarkdown(getReplaceText(originalText, version), messageId)}</div>`;
 }
@@ -1724,6 +1812,7 @@ function restoreRenderedHtmlDocumentDisplay(messageId, record, renderKey) {
     if (!$text.length) return false;
     const version = getSelectedVersion(record);
     if (!version || !isHtmlDocumentVersion(version)) return false;
+    if (isMixedHtmlDocumentVersion(version)) return false;
     const htmlSegments = getEffectiveHtmlVersionSegments(version, getMessageData(messageId)?.mes || '');
     if (!htmlSegments.length) return false;
     const iframe = findRenderedHtmlIframe($text);
@@ -1762,8 +1851,9 @@ function applyDisplay(messageId) {
     const mode = record.displayMode || version.displayMode || settings.displayMode;
     const renderKey = getTextRenderKey(messageId, mode, version);
     const htmlVersion = isHtmlDocumentVersion(version);
+    const mixedHtmlVersion = htmlVersion && isMixedHtmlDocumentVersion(version);
     if ($text.attr('data-stft-render-key') === renderKey) {
-        if (htmlVersion && !hasRenderedIframeTranslation($text, renderKey)) {
+        if (htmlVersion && !mixedHtmlVersion && !hasRenderedIframeTranslation($text, renderKey)) {
             $text.removeAttr('data-stft-render-key');
         } else {
         updateButtonState($mes);
@@ -1773,13 +1863,15 @@ function applyDisplay(messageId) {
 
     if (htmlVersion) {
         const htmlSegments = getEffectiveHtmlVersionSegments(version, message.mes);
-        if (htmlSegments.length && applyRenderedHtmlDocumentDisplay(messageId, htmlSegments, renderKey)) {
-            updateButtonState(getMessageElement(messageId));
-            return;
-        }
-        if (htmlSegments.length) {
-            updateButtonState(getMessageElement(messageId));
-            return;
+        if (!mixedHtmlVersion) {
+            if (htmlSegments.length && applyRenderedHtmlDocumentDisplay(messageId, htmlSegments, renderKey)) {
+                updateButtonState(getMessageElement(messageId));
+                return;
+            }
+            if (htmlSegments.length) {
+                updateButtonState(getMessageElement(messageId));
+                return;
+            }
         }
         const displayText = buildHtmlNativeDisplayText(message.mes, version, mode);
         if (applyNativeHtmlDocumentDisplay(messageId, displayText, true, true, renderKey)) {
@@ -2220,6 +2312,7 @@ function normalizeReturnedSegments(parsed, sourceSegments) {
         return {
             id: sourceSegment.id,
             source: sourceSegment.source,
+            kind: sourceSegment.kind,
             translation,
         };
     });
