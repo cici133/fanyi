@@ -213,7 +213,6 @@ const inFlight = new Map();
 const liveTranslations = new Map();
 const mutedLiveDisplays = new Set();
 const originalRenderCache = new Map();
-const nativeRenderCache = new Map();
 
 function clone(value) {
     return JSON.parse(JSON.stringify(value));
@@ -829,74 +828,6 @@ function applyHtmlTranslationPlan(plan, translatedSegments = []) {
     return output;
 }
 
-function createTranslatedHtmlLayoutGuard() {
-    return `<style data-stft-layout-guard>
-@media (max-width: 900px) {
-    body[data-stft-layout-guard-ready="row-flex"] {
-        align-items: flex-start !important;
-        align-content: flex-start !important;
-    }
-    body[data-stft-layout-guard-ready="column-flex"] {
-        justify-content: flex-start !important;
-        align-content: flex-start !important;
-    }
-    body[data-stft-layout-guard-ready="grid"] {
-        align-items: start !important;
-        align-content: start !important;
-    }
-}
-</style>
-<script data-stft-layout-guard>
-(function () {
-    function applyGuard() {
-        var body = document.body;
-        if (!body || !window.matchMedia || !window.matchMedia('(max-width: 900px)').matches) return;
-        var style = window.getComputedStyle ? window.getComputedStyle(body) : null;
-        if (!style) return;
-        var display = String(style.display || '');
-        if (display.indexOf('flex') !== -1) {
-            var direction = String(style.flexDirection || 'row');
-            if (direction.indexOf('column') === 0) {
-                body.setAttribute('data-stft-layout-guard-ready', 'column-flex');
-                body.style.setProperty('justify-content', 'flex-start', 'important');
-            } else {
-                body.setAttribute('data-stft-layout-guard-ready', 'row-flex');
-                body.style.setProperty('align-items', 'flex-start', 'important');
-            }
-            body.style.setProperty('align-content', 'flex-start', 'important');
-            return;
-        }
-        if (display.indexOf('grid') !== -1) {
-            body.setAttribute('data-stft-layout-guard-ready', 'grid');
-            body.style.setProperty('align-items', 'start', 'important');
-            body.style.setProperty('align-content', 'start', 'important');
-        }
-    }
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', applyGuard);
-    else applyGuard();
-    window.setTimeout(applyGuard, 80);
-    window.setTimeout(applyGuard, 400);
-})();
-<\/script>`;
-}
-
-function injectTranslatedHtmlLayoutGuard(htmlSource) {
-    const source = String(htmlSource ?? '');
-    if (!source || /data-stft-layout-guard/i.test(source)) return source;
-    const guard = createTranslatedHtmlLayoutGuard();
-    if (/<\/head\s*>/i.test(source)) {
-        return source.replace(/<\/head\s*>/i, `${guard}\n</head>`);
-    }
-    if (/<body(?:\s|>)/i.test(source)) {
-        return source.replace(/<body\b[^>]*>/i, match => `${match}\n${guard}`);
-    }
-    return `${guard}\n${source}`;
-}
-
-function stabilizeTranslatedHtmlLayout(displayText) {
-    return String(displayText ?? '');
-}
-
 function makeHtmlTranslationResult(plan, translatedSegments, targetLanguage, raw = '', usedFallback = false) {
     const htmlText = applyHtmlTranslationPlan(plan, translatedSegments);
     const missingTranslationCount = translatedSegments.filter(segment => !String(segment.translation ?? '').trim()).length;
@@ -1159,8 +1090,8 @@ function replaceFrameVhInContent(content) {
 
 function createTranslatorFrameSrcdoc(htmlSource) {
     const content = replaceFrameVhInContent(htmlSource);
-    const frameScript = `
-<script>
+    const frameTools = `
+<script data-stft-frame-tools>
 (function () {
     var resizeTimer = 0;
     function setViewportHeight() {
@@ -1174,8 +1105,11 @@ function createTranslatorFrameSrcdoc(htmlSource) {
     function measure() {
         var body = document.body;
         if (!body || !window.frameElement) return;
-        window.frameElement.style.height = '1px';
-        var height = body.scrollHeight || body.offsetHeight || 0;
+        var rectHeight = 0;
+        try {
+            rectHeight = body.getBoundingClientRect ? body.getBoundingClientRect().height : 0;
+        } catch (_error) {}
+        var height = Math.max(body.scrollHeight || 0, body.offsetHeight || 0, rectHeight || 0, 160);
         if (!Number.isFinite(height) || height <= 0) return;
         window.frameElement.style.height = Math.min(height + 2, 6000) + 'px';
     }
@@ -1193,7 +1127,6 @@ function createTranslatorFrameSrcdoc(htmlSource) {
         window.addEventListener('DOMContentLoaded', function () {
             try {
                 var observer = new ResizeObserver(schedule);
-                observer.observe(document.documentElement);
                 if (document.body) observer.observe(document.body);
             } catch (_error) {}
         });
@@ -1204,28 +1137,26 @@ function createTranslatorFrameSrcdoc(htmlSource) {
     window.setTimeout(schedule, 650);
 })();
 <\/script>`;
-
-    return `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
+    const frameHead = `
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <base href="${escapeHtml(window.location.origin)}/">
-<style>
-*,*::before,*::after{box-sizing:border-box;}
-html,body{margin:0!important;padding:0;overflow:hidden!important;max-width:100%!important;}
-</style>
-${frameScript}
-</head>
-<body>
-${content}
-</body>
+${frameTools}`;
+
+    if (/<\/head\s*>/i.test(content)) {
+        return content.replace(/<\/head\s*>/i, `${frameHead}\n</head>`);
+    }
+    if (/<html[\s>]/i.test(content)) {
+        return content.replace(/<html\b[^>]*>/i, match => `${match}\n<head>${frameHead}</head>`);
+    }
+    return `<!DOCTYPE html>
+<html>
+<head>${frameHead}</head>
+<body>${content}</body>
 </html>`;
 }
 
 function renderHtmlIframeDocument(htmlSource, variant = 'translation') {
-    const rawSource = String(htmlSource ?? '');
-    const source = (variant === 'translation' ? stabilizeTranslatedHtmlLayout(rawSource) : rawSource).trim();
+    const source = String(htmlSource ?? '').trim();
     if (!source) return '';
     const srcdoc = createTranslatorFrameSrcdoc(source);
     return `<div class="stft-html-frame-wrap stft-html-frame-${escapeHtml(variant)}">
@@ -1246,12 +1177,11 @@ function bindHtmlFrameSizing(messageId) {
             setTimeout(() => resizeFallbackIframe(iframe), 120);
             setTimeout(() => resizeFallbackIframe(iframe), 600);
             try {
-                const doc = iframe.contentDocument;
-                if (doc && typeof ResizeObserver !== 'undefined') {
-                    const observer = new ResizeObserver(() => resizeFallbackIframe(iframe));
-                    observer.observe(doc.documentElement);
-                    if (doc.body) observer.observe(doc.body);
-                }
+            const doc = iframe.contentDocument;
+            if (doc && typeof ResizeObserver !== 'undefined') {
+                const observer = new ResizeObserver(() => resizeFallbackIframe(iframe));
+                if (doc.body) observer.observe(doc.body);
+            }
             } catch {
                 // Some mobile WebViews refuse srcdoc sizing until after load.
             }
@@ -1302,12 +1232,7 @@ function renderHtmlDocumentVersion(messageId, version) {
 
 function renderCompareHtml(originalText, version, messageId) {
     if (isHtmlDocumentVersion(version)) {
-        return `<div class="stft-render stft-compare-render stft-html-document-render">${renderInlineToggleButton(messageId, true)}
-            <div class="stft-compare-pair">
-                <div class="stft-compare-original">${renderOriginalHtmlDocument(messageId)}</div>
-                <div class="stft-compare-translation">${renderHtmlDocumentVersion(messageId, version)}</div>
-            </div>
-        </div>`;
+        return `<div class="stft-render stft-replace-render stft-html-document-render">${renderInlineToggleButton(messageId, true)}${renderHtmlDocumentVersion(messageId, version)}</div>`;
     }
     const segments = normalizeVersionSegments(version, originalText);
     let html = '<div class="stft-render stft-compare-render">';
@@ -1338,10 +1263,11 @@ function getReplaceText(originalText, version) {
 function buildHtmlNativeDisplayText(originalText, version, mode) {
     const translatedText = String(getHtmlDocumentVersionText(version, originalText) || '').trim();
     if (!translatedText) return '';
-    // Full-page HTML beautifications are rendered by Tavern Helper as iframe
-    // apps. Rendering original + translation at the same time creates two full
-    // documents and can trigger a height feedback loop on mobile WebViews.
-    return stabilizeTranslatedHtmlLayout(translatedText);
+    if (mode === displayModes.replace) return translatedText;
+
+    const sourceText = String(originalText ?? '').trim();
+    if (!sourceText) return translatedText;
+    return `${sourceText}\n\n---\n\n${translatedText}`;
 }
 
 function renderReplaceHtml(originalText, version, messageId) {
@@ -1376,6 +1302,7 @@ function emitNativeMessageRendered(messageId) {
     const eventName = message.is_user ? event_types.USER_MESSAGE_RENDERED : event_types.CHARACTER_MESSAGE_RENDERED;
     try {
         void eventSource.emit(eventName, Number(messageId), 'floor_translator');
+        void eventSource.emit(event_types.MESSAGE_UPDATED, Number(messageId));
     } catch (error) {
         console.warn('[Floor Translator] message rendered event failed', error);
     }
@@ -1399,9 +1326,8 @@ function resizeFallbackIframe(iframe) {
     try {
         const doc = iframe.contentDocument;
         if (!doc) return;
-        iframe.style.height = '1px';
-        const bodyHeight = doc.body?.scrollHeight || doc.body?.offsetHeight || 0;
-        const height = bodyHeight || doc.documentElement?.scrollHeight || 160;
+        const rectHeight = doc.body?.getBoundingClientRect?.().height || 0;
+        const height = Math.max(doc.body?.scrollHeight || 0, doc.body?.offsetHeight || 0, rectHeight || 0, 160);
         if (!Number.isFinite(height) || height <= 0) return;
         iframe.style.height = `${Math.min(height + 2, 6000)}px`;
     } catch {
@@ -1426,7 +1352,6 @@ function mountFallbackFrontendIframe(pre, code) {
             const doc = iframe.contentDocument;
             if (doc && typeof ResizeObserver !== 'undefined') {
                 const observer = new ResizeObserver(() => resizeFallbackIframe(iframe));
-                observer.observe(doc.documentElement);
                 if (doc.body) observer.observe(doc.body);
             }
         } catch {
@@ -1531,10 +1456,6 @@ function restoreNativeMessageDisplay(messageId, hasTranslation, renderKey) {
 function applyNativeHtmlDocumentDisplay(messageId, displayText, hasTranslation, visible, renderKey) {
     if (!String(displayText ?? '').trim()) return false;
     if (!rerenderNativeMessageWithDisplayText(messageId, displayText)) return false;
-    nativeRenderCache.set(getMessageRecordKey(messageId), {
-        renderKey,
-        appliedAt: Date.now(),
-    });
 
     const addToggle = () => {
         const $freshText = getMessageElement(messageId).find('.mes_text').first();
@@ -1545,16 +1466,6 @@ function applyNativeHtmlDocumentDisplay(messageId, displayText, hasTranslation, 
     setTimeout(addToggle, 0);
     setTimeout(addToggle, 180);
     setTimeout(addToggle, 560);
-    return true;
-}
-
-function isRecentlyAppliedNativeRender(recordKey, renderKey) {
-    const cached = nativeRenderCache.get(recordKey);
-    if (!cached || cached.renderKey !== renderKey) return false;
-    if (Date.now() - cached.appliedAt > 5000) {
-        nativeRenderCache.delete(recordKey);
-        return false;
-    }
     return true;
 }
 
@@ -1591,21 +1502,6 @@ function applyDisplay(messageId) {
         return;
     }
 
-    if (htmlVersion && isRecentlyAppliedNativeRender(recordKey, renderKey)) {
-        prependInlineToggleIfNeeded(messageId, $text, true, true);
-        $text.attr('data-stft-render-key', renderKey);
-        updateButtonState($mes);
-        return;
-    }
-
-    if (htmlVersion) {
-        const displayText = buildHtmlNativeDisplayText(message.mes, version, mode);
-        if (applyNativeHtmlDocumentDisplay(messageId, displayText, true, true, renderKey)) {
-            updateButtonState($mes);
-            return;
-        }
-    }
-
     rememberOriginalRender(messageId, $text);
     const html = mode === displayModes.replace
         ? renderReplaceHtml(message.mes, version, messageId)
@@ -1626,7 +1522,6 @@ function restoreDisplay(messageId, updateRecord = true) {
     const $mes = getMessageElement(messageId);
     const message = getMessageData(messageId);
     const $text = $mes.find('.mes_text').first();
-    nativeRenderCache.delete(getMessageRecordKey(messageId));
     if ($text.length && message) {
         const record = loadStore().messages[getMessageRecordKey(messageId)];
         const hasTranslation = hasDisplayableVersion(record);
