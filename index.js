@@ -1548,83 +1548,18 @@ html,
 body {
     min-height: 0 !important;
     height: auto !important;
-    overflow: hidden !important;
-}
-body {
-    transform: translateY(calc(var(--stft-shift-y, 0px) * -1)) !important;
-    transform-origin: 0 0 !important;
 }
 `;
-}
-
-function isMeasurableIframeElement(element) {
-    if (!element || element.nodeType !== Node.ELEMENT_NODE) return false;
-    if (element.closest('script, style, link, meta, title, head')) return false;
-    const style = element.ownerDocument?.defaultView?.getComputedStyle?.(element);
-    if (style && (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0)) return false;
-    const rect = element.getBoundingClientRect?.();
-    return Boolean(rect && rect.width > 1 && rect.height > 1);
-}
-
-function getTranslatedIframeContentBounds(doc) {
-    const currentShift = Number.parseFloat(doc.documentElement.style.getPropertyValue('--stft-shift-y')) || 0;
-    const rects = [];
-    const textWalker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
-        acceptNode(node) {
-            if (!shouldTranslateRenderedIframeTextNode(node)) return NodeFilter.FILTER_REJECT;
-            return String(node.nodeValue ?? '').trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
-        },
-    });
-
-    let textNode;
-    while ((textNode = textWalker.nextNode())) {
-        const element = textNode.parentElement;
-        if (!isMeasurableIframeElement(element)) continue;
-        rects.push(element.getBoundingClientRect());
-    }
-
-    if (!rects.length) {
-        const elements = doc.body.querySelectorAll('img, svg, canvas, video, iframe, section, article, main, div, p, h1, h2, h3, h4, h5, h6');
-        for (const element of elements) {
-            if (!isMeasurableIframeElement(element)) continue;
-            rects.push(element.getBoundingClientRect());
-        }
-    }
-
-    if (!rects.length) return null;
-    const minTop = Math.min(...rects.map(rect => rect.top + currentShift));
-    const maxBottom = Math.max(...rects.map(rect => rect.bottom + currentShift));
-    const minLeft = Math.min(...rects.map(rect => rect.left));
-    const maxRight = Math.max(...rects.map(rect => rect.right));
-    const height = maxBottom - minTop;
-    const width = maxRight - minLeft;
-    if (!Number.isFinite(height) || height <= 0 || !Number.isFinite(width) || width <= 0) return null;
-    return { top: minTop, bottom: maxBottom, height, width };
 }
 
 function resizeTranslatedIframe(iframe) {
     try {
         const doc = iframe.contentDocument;
         if (!doc?.body) return;
-        const bounds = getTranslatedIframeContentBounds(doc);
-        const shift = bounds ? Math.max(0, Math.floor(bounds.top - 12)) : 0;
-        if (bounds) {
-            doc.documentElement.style.setProperty('--stft-shift-y', `${shift}px`);
-        }
-        const measuredHeight = bounds ? bounds.height + 24 : 0;
-        const rectHeight = bounds?.height || doc.body.getBoundingClientRect?.().height || 0;
-        const height = Math.max(measuredHeight, rectHeight || 0, 160);
+        const rectHeight = doc.body.getBoundingClientRect?.().height || 0;
+        const height = Math.max(doc.body.scrollHeight || 0, doc.body.offsetHeight || 0, rectHeight || 0, 160);
         if (!Number.isFinite(height) || height <= 0) return;
-        const nextHeight = Math.min(Math.ceil(height + 2), 6000);
-        try {
-            Object.defineProperty(doc.body, 'scrollHeight', { configurable: true, get: () => nextHeight });
-            Object.defineProperty(doc.body, 'offsetHeight', { configurable: true, get: () => nextHeight });
-            Object.defineProperty(doc.documentElement, 'scrollHeight', { configurable: true, get: () => nextHeight });
-            Object.defineProperty(doc.documentElement, 'offsetHeight', { configurable: true, get: () => nextHeight });
-        } catch {
-            // Some WebViews do not allow overriding layout properties.
-        }
-        iframe.style.height = `${nextHeight}px`;
+        iframe.style.height = `${Math.min(Math.ceil(height + 2), 6000)}px`;
     } catch {
         // Keep Tavern Helper's own height if direct measurement is blocked.
     }
@@ -1634,8 +1569,6 @@ function scheduleTranslatedIframeResize(iframe) {
     resizeTranslatedIframe(iframe);
     setTimeout(() => resizeTranslatedIframe(iframe), 80);
     setTimeout(() => resizeTranslatedIframe(iframe), 260);
-    setTimeout(() => resizeTranslatedIframe(iframe), 800);
-    setTimeout(() => resizeTranslatedIframe(iframe), 1600);
 }
 
 function applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey) {
