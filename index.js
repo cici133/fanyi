@@ -1505,9 +1505,16 @@ function applyDisplay(messageId) {
     const renderKey = getTextRenderKey(messageId, mode, version);
     const htmlVersion = isHtmlDocumentVersion(version);
     if ($text.attr('data-stft-render-key') === renderKey) {
-        if (htmlVersion) bindHtmlFrameSizing(messageId);
         updateButtonState($mes);
         return;
+    }
+
+    if (htmlVersion) {
+        const displayText = buildHtmlNativeDisplayText(message.mes, version, mode);
+        if (applyNativeHtmlDocumentDisplay(messageId, displayText, true, true, renderKey)) {
+            updateButtonState($mes);
+            return;
+        }
     }
 
     rememberOriginalRender(messageId, $text);
