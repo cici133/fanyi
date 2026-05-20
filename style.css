@@ -111,6 +111,16 @@
     width: 100%;
 }
 
+.stft-html-code-wrap {
+    display: block;
+    margin: 0;
+    width: 100%;
+}
+
+.stft-html-code-source {
+    margin: 0;
+}
+
 .stft-compare-pair {
     margin: 0 0 0.85em;
 }

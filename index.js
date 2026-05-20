@@ -1158,9 +1158,8 @@ ${frameTools}`;
 function renderHtmlIframeDocument(htmlSource, variant = 'translation') {
     const source = String(htmlSource ?? '').trim();
     if (!source) return '';
-    const srcdoc = createTranslatorFrameSrcdoc(source);
-    return `<div class="stft-html-frame-wrap stft-html-frame-${escapeHtml(variant)}">
-        <iframe class="stft-html-frame" loading="lazy" referrerpolicy="no-referrer" srcdoc="${escapeHtml(srcdoc)}"></iframe>
+    return `<div class="stft-html-code-wrap stft-html-code-${escapeHtml(variant)}">
+        <pre class="stft-html-code-source"><code class="language-html">${escapeHtml(source)}</code></pre>
     </div>`;
 }
 
@@ -1302,7 +1301,6 @@ function emitNativeMessageRendered(messageId) {
     const eventName = message.is_user ? event_types.USER_MESSAGE_RENDERED : event_types.CHARACTER_MESSAGE_RENDERED;
     try {
         void eventSource.emit(eventName, Number(messageId), 'floor_translator');
-        void eventSource.emit(event_types.MESSAGE_UPDATED, Number(messageId));
     } catch (error) {
         console.warn('[Floor Translator] message rendered event failed', error);
     }
@@ -1513,7 +1511,7 @@ function applyDisplay(messageId) {
     }
     $text.attr('data-stft-render-key', renderKey);
     if (htmlVersion) {
-        bindHtmlFrameSizing(messageId);
+        scheduleNativeMessageRendered(messageId);
     }
     updateButtonState($mes);
 }
