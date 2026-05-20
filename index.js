@@ -1528,6 +1528,18 @@ function buildHtmlSegmentQueues(htmlSegments) {
     return queues;
 }
 
+function buildHtmlRestoreQueues(htmlSegments) {
+    const queues = new Map();
+    for (const segment of htmlSegments || []) {
+        const source = String(segment.source ?? '').trim();
+        const translationKey = normalizeHtmlTextForMatch(segment.translation ?? segment.text);
+        if (!source || !translationKey) continue;
+        if (!queues.has(translationKey)) queues.set(translationKey, []);
+        queues.get(translationKey).push(source);
+    }
+    return queues;
+}
+
 function stabilizeTranslatedIframeLayout(iframe) {
     let doc;
     try {
@@ -1569,6 +1581,19 @@ function scheduleTranslatedIframeResize(iframe) {
     resizeTranslatedIframe(iframe);
     setTimeout(() => resizeTranslatedIframe(iframe), 80);
     setTimeout(() => resizeTranslatedIframe(iframe), 260);
+}
+
+function removeTranslatedIframeLayout(iframe) {
+    try {
+        const doc = iframe.contentDocument;
+        doc?.getElementById('stft-translated-layout-fix')?.remove();
+        if (doc?.documentElement) {
+            doc.documentElement.style.removeProperty('--stft-shift-y');
+        }
+        scheduleTranslatedIframeResize(iframe);
+    } catch {
+        // If the frame is temporarily inaccessible, leave Tavern Helper's own render intact.
+    }
 }
 
 function applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey) {
@@ -1613,6 +1638,47 @@ function applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey) {
     return true;
 }
 
+function restoreHtmlSegmentsInRenderedIframe(iframe, htmlSegments) {
+    const queues = buildHtmlRestoreQueues(htmlSegments);
+    if (!queues.size) return false;
+
+    let doc;
+    try {
+        doc = iframe.contentDocument;
+    } catch {
+        return false;
+    }
+    if (!doc?.body) return false;
+
+    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+            return shouldTranslateRenderedIframeTextNode(node)
+                ? NodeFilter.FILTER_ACCEPT
+                : NodeFilter.FILTER_REJECT;
+        },
+    });
+
+    let changed = false;
+    let node;
+    while ((node = walker.nextNode())) {
+        const raw = String(node.nodeValue ?? '');
+        const leading = raw.match(/^\s*/)?.[0] ?? '';
+        const trailing = raw.match(/\s*$/)?.[0] ?? '';
+        const core = raw.slice(leading.length, raw.length - trailing.length);
+        const key = normalizeHtmlTextForMatch(core);
+        const queue = queues.get(key);
+        const source = queue?.shift();
+        if (!source) continue;
+        node.nodeValue = `${leading}${source}${trailing}`;
+        changed = true;
+    }
+
+    if (!changed) return false;
+    delete iframe.dataset.stftTranslationKey;
+    removeTranslatedIframeLayout(iframe);
+    return true;
+}
+
 function hasRenderedIframeTranslation($text, renderKey) {
     return $text.find('.TH-render iframe').toArray().some(iframe => iframe.dataset?.stftTranslationKey === renderKey);
 }
@@ -1649,6 +1715,21 @@ function applyRenderedHtmlDocumentDisplay(messageId, htmlSegments, renderKey) {
 
     if (!applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey)) return false;
     prependInlineToggleIfNeeded(messageId, $text, true, true);
+    $text.attr('data-stft-render-key', renderKey);
+    return true;
+}
+
+function restoreRenderedHtmlDocumentDisplay(messageId, record, renderKey) {
+    const $text = getMessageElement(messageId).find('.mes_text').first();
+    if (!$text.length) return false;
+    const version = getSelectedVersion(record);
+    if (!version || !isHtmlDocumentVersion(version)) return false;
+    const htmlSegments = getEffectiveHtmlVersionSegments(version, getMessageData(messageId)?.mes || '');
+    if (!htmlSegments.length) return false;
+    const iframe = findRenderedHtmlIframe($text);
+    if (!iframe) return false;
+    if (!restoreHtmlSegmentsInRenderedIframe(iframe, htmlSegments)) return false;
+    prependInlineToggleIfNeeded(messageId, $text, true, false);
     $text.attr('data-stft-render-key', renderKey);
     return true;
 }
@@ -1731,6 +1812,15 @@ function restoreDisplay(messageId, updateRecord = true) {
         const record = loadStore().messages[getMessageRecordKey(messageId)];
         const hasTranslation = hasDisplayableVersion(record);
         const renderKey = getTextRenderKey(messageId, hasTranslation ? 'original-toggle' : 'original');
+        if (restoreRenderedHtmlDocumentDisplay(messageId, record, renderKey)) {
+            if (updateRecord) {
+                updateMessageRecord(messageId, nextRecord => {
+                    nextRecord.visible = false;
+                });
+            }
+            updateButtonState($mes);
+            return;
+        }
         if (restoreNativeMessageDisplay(messageId, hasTranslation, renderKey)) {
             if (updateRecord) {
                 updateMessageRecord(messageId, nextRecord => {
