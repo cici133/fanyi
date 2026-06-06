@@ -51,6 +51,9 @@ const BUILTIN_TRANSLATE_SWIPE_GUARD_KEY = '__floorTranslatorSwipeGuardInstalled'
 const builtinTranslateIncomingModes = new Set(['responses', 'both']);
 const machineConcurrency = 4;
 const googleChunkLength = 1300;
+const googleBatchMaxSegments = 18;
+const googleBatchMaxChars = googleChunkLength;
+const googleBatchMarkerRegex = /\s*⟦\s*\d{6}\s*⟧\s*/gu;
 
 const languages = [
     ['auto', '自动识别'],
@@ -3020,6 +3023,81 @@ async function translateWithGoogleWeb(text, targetLanguage) {
     return decodeHtmlEntities(translated.trim());
 }
 
+function makeGoogleBatchMarker(index) {
+    return `\n\n⟦${String(index).padStart(6, '0')}⟧\n\n`;
+}
+
+function makeGoogleSegmentBatches(segments) {
+    const batches = [];
+    let current = [];
+    let currentLength = 0;
+
+    const pushCurrent = () => {
+        if (current.length) batches.push(current);
+        current = [];
+        currentLength = 0;
+    };
+
+    for (const segment of segments || []) {
+        const source = String(segment?.source ?? '');
+        const markerCost = current.length ? makeGoogleBatchMarker(current.length).length : 0;
+        const nextLength = currentLength + markerCost + source.length;
+        const tooManySegments = current.length >= googleBatchMaxSegments;
+        const tooLong = current.length && nextLength > googleBatchMaxChars;
+
+        if (tooManySegments || tooLong) {
+            pushCurrent();
+        }
+
+        if (source.length > googleBatchMaxChars) {
+            batches.push([segment]);
+            continue;
+        }
+
+        const markerLength = current.length ? makeGoogleBatchMarker(current.length).length : 0;
+        current.push(segment);
+        currentLength += markerLength + source.length;
+    }
+
+    pushCurrent();
+    return batches;
+}
+
+function joinGoogleBatchSegments(batch) {
+    return batch
+        .map((segment, index) => `${index ? makeGoogleBatchMarker(index) : ''}${String(segment.source ?? '')}`)
+        .join('');
+}
+
+function splitGoogleBatchTranslation(text, expectedCount) {
+    const parts = String(text ?? '')
+        .split(googleBatchMarkerRegex)
+        .map(part => decodeHtmlEntities(part).trim());
+    if (parts.length !== expectedCount) return null;
+    if (parts.some(part => !part)) return null;
+    return parts;
+}
+
+async function translateGoogleSegmentBatch(batch, targetLanguage) {
+    if (!Array.isArray(batch) || !batch.length) return [];
+    if (batch.length === 1) return [await translateWithGoogleWeb(batch[0].source, targetLanguage)];
+
+    const joined = joinGoogleBatchSegments(batch);
+    try {
+        const translated = await translateWithGoogleWeb(joined, targetLanguage);
+        const parts = splitGoogleBatchTranslation(translated, batch.length);
+        if (parts?.length === batch.length) return parts;
+    } catch {
+        // Fall through to the old per-segment path. Speed should never cost correctness.
+    }
+
+    const fallback = [];
+    for (const segment of batch) {
+        fallback.push(await translateWithGoogleWeb(segment.source, targetLanguage));
+    }
+    return fallback;
+}
+
 function getMicrosoftTranslateUrl() {
     const base = String(settings.microsoftEndpoint || 'https://api.cognitive.microsofttranslator.com').trim().replace(/\/+$/, '');
     if (!base) throw new Error('请填写 Microsoft Translator Endpoint。');
@@ -3085,7 +3163,6 @@ async function requestMachineTranslationText(sourceText, options, onProgress) {
     let completed = 0;
     let nextIndex = 0;
     const total = resultSegments.length;
-    const translateOne = channel === translationChannels.microsoft ? translateWithMicrosoft : translateWithGoogleWeb;
 
     const emitProgress = () => {
         const progressResult = htmlPlan
@@ -3102,19 +3179,39 @@ async function requestMachineTranslationText(sourceText, options, onProgress) {
         });
     };
 
-    const worker = async () => {
-        while (nextIndex < total) {
-            const index = nextIndex;
-            nextIndex += 1;
-            const segment = resultSegments[index];
-            segment.translation = await translateOne(segment.source, options.language);
-            completed += 1;
-            emitProgress();
-        }
-    };
+    if (channel === translationChannels.google) {
+        const batches = makeGoogleSegmentBatches(resultSegments);
+        let nextBatchIndex = 0;
+        const worker = async () => {
+            while (nextBatchIndex < batches.length) {
+                const batchIndex = nextBatchIndex;
+                nextBatchIndex += 1;
+                const batch = batches[batchIndex];
+                const translations = await translateGoogleSegmentBatch(batch, options.language);
+                batch.forEach((segment, index) => {
+                    segment.translation = translations[index] || '';
+                });
+                completed += batch.length;
+                emitProgress();
+            }
+        };
+        const workers = Array.from({ length: Math.min(machineConcurrency, Math.max(batches.length, 1)) }, () => worker());
+        await Promise.all(workers);
+    } else {
+        const worker = async () => {
+            while (nextIndex < total) {
+                const index = nextIndex;
+                nextIndex += 1;
+                const segment = resultSegments[index];
+                segment.translation = await translateWithMicrosoft(segment.source, options.language);
+                completed += 1;
+                emitProgress();
+            }
+        };
 
-    const workers = Array.from({ length: Math.min(machineConcurrency, Math.max(total, 1)) }, () => worker());
-    await Promise.all(workers);
+        const workers = Array.from({ length: Math.min(machineConcurrency, Math.max(total, 1)) }, () => worker());
+        await Promise.all(workers);
+    }
     if (htmlPlan) {
         const htmlResult = makePlannedTranslationResult(htmlPlan, resultSegments, options.language, '', false);
         if (!htmlResult.text) throw new Error(`${getChannelName(channel)} 没有生成译文。`);
