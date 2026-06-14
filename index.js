@@ -1,4 +1,4 @@
-import { eventSource, event_types, getRequestHeaders, saveSettingsDebounced, updateMessageBlock } from '../../../../script.js';
+﻿import { eventSource, event_types, getRequestHeaders, saveSettingsDebounced, updateMessageBlock } from '../../../../script.js';
 import { extension_settings, getContext } from '../../../extensions.js';
 
 const EXTENSION_NAME = 'floorTranslator';
@@ -183,6 +183,7 @@ const defaultSettings = {
     translationChannel: translationChannels.ai,
     endpoint: '',
     model: 'gpt-4o-mini',
+    modelList: [],
     apiKey: '',
     authMode: authModes.bearer,
     customAuthHeader: 'Authorization',
@@ -3554,6 +3555,28 @@ function promptOptions(selected) {
     return settings.prompts.map(prompt => `<option value="${escapeHtml(prompt.id)}"${prompt.id === selected ? ' selected' : ''}>${escapeHtml(prompt.name)}</option>`).join('');
 }
 
+function getStoredModelList() {
+    const models = Array.isArray(settings.modelList) ? settings.modelList : [];
+    return [...new Set(models.map(model => String(model || '').trim()).filter(Boolean))];
+}
+
+function modelOptions(selected) {
+    const current = String(selected || '').trim();
+    const models = getStoredModelList();
+    if (current && !models.includes(current)) models.unshift(current);
+    const placeholder = models.length ? '选择已拉取的模型...' : '尚未拉取模型，可手动填写';
+    return `<option value="">${escapeHtml(placeholder)}</option>` + models
+        .map(model => `<option value="${escapeHtml(model)}"${model === current ? ' selected' : ''}>${escapeHtml(model)}</option>`)
+        .join('');
+}
+
+function refreshModelSelect() {
+    const $select = $('#stft_model_select');
+    if (!$select.length) return;
+    $select.html(modelOptions(settings.model));
+    $select.val(settings.model || '');
+}
+
 function renderSettingsPanel() {
     if ($(`#${SETTINGS_ID}`).length) return;
     const prompt = getPromptById(settings.activePresetId);
@@ -3576,8 +3599,14 @@ function renderSettingsPanel() {
                         <label class="stft-span-2 stft-ai-setting">副 API / 反代地址
                             <input id="stft_endpoint" class="text_pole" placeholder="https://example.com/v1" value="${escapeHtml(settings.endpoint)}">
                         </label>
-                        <label class="stft-ai-setting">模型
-                            <input id="stft_model" class="text_pole" placeholder="gpt-4o-mini" value="${escapeHtml(settings.model)}">
+                        <label class="stft-span-2 stft-ai-setting">模型
+                            <div class="stft-row">
+                                <input id="stft_model" class="text_pole" placeholder="gpt-4o-mini" value="${escapeHtml(settings.model)}">
+                                <div id="stft_fetch_models" class="menu_button" title="从当前副 API / 反代地址拉取 /models 模型列表"><i class="fa-solid fa-cloud-arrow-down"></i><span>拉取模型</span></div>
+                            </div>
+                        </label>
+                        <label id="stft_model_select_label" class="stft-span-2 stft-ai-setting">模型列表
+                            <select id="stft_model_select" class="text_pole">${modelOptions(settings.model)}</select>
                         </label>
                         <label class="stft-ai-setting">温度
                             <input id="stft_temperature" class="text_pole" type="number" step="0.1" min="0" max="2" value="${escapeHtml(settings.temperature)}">
@@ -3700,8 +3729,18 @@ function bindSettingsPanel() {
     $('#stft_endpoint').on('input', event => setAndSave('endpoint', event.target.value.trim()));
     $('#stft_model').on('input', event => {
         setAndSave('model', event.target.value.trim());
+        refreshModelSelect();
         refreshConditionalSettings();
     });
+    $('#stft_model_select').on('change', event => {
+        const model = String(event.target.value || '').trim();
+        if (!model) return;
+        $('#stft_model').val(model);
+        setAndSave('model', model);
+        refreshModelSelect();
+        refreshConditionalSettings();
+    });
+    $('#stft_fetch_models').on('click', fetchModelsForSettings);
     $('#stft_api_key').on('input', event => setAndSave('apiKey', event.target.value));
     $('#stft_auth_mode').on('change', event => {
         setAndSave('authMode', event.target.value);
@@ -3838,6 +3877,146 @@ function deleteCurrentPrompt() {
     refreshPromptSelect();
     $('#stft_prompt_name').val(next.name);
     $('#stft_prompt_text').val(next.text);
+}
+
+function normalizeModelsEndpoint(endpoint = settings.endpoint) {
+    const base = normalizeBaseEndpoint(endpoint);
+    if (!base) return '';
+    return /\/models$/i.test(base) ? base : `${base}/models`;
+}
+
+function normalizeFetchedModels(data) {
+    const source = Array.isArray(data?.data?.data)
+        ? data.data.data
+        : Array.isArray(data?.data)
+            ? data.data
+            : Array.isArray(data?.models)
+                ? data.models
+                : Array.isArray(data)
+                    ? data
+                    : [];
+    const models = source
+        .map(item => {
+            if (typeof item === 'string') return item;
+            return item?.id ?? item?.name ?? item?.model ?? item?.slug ?? '';
+        })
+        .map(model => String(model || '').trim())
+        .filter(Boolean);
+    return [...new Set(models)].sort((a, b) => a.localeCompare(b));
+}
+
+function modelFetchError(data, raw, fallback = '模型列表请求失败') {
+    return compactHttpError(data?.error?.message || data?.message || data?.error || raw, fallback);
+}
+
+async function requestModelsViaTavernBackend() {
+    const baseEndpoint = normalizeBaseEndpoint(settings.endpoint);
+    if (!baseEndpoint) throw new Error('请先填写副 API / 反代地址。');
+
+    const payload = {};
+    const backendCompatMode = settings.backendCompatMode || backendCompatModes.openaiProxy;
+    if (backendCompatMode === backendCompatModes.custom) {
+        payload.chat_completion_source = 'custom';
+        payload.custom_url = baseEndpoint;
+        payload.custom_include_headers = buildTavernBackendHeaders();
+    } else {
+        payload.chat_completion_source = 'openai';
+        payload.reverse_proxy = baseEndpoint;
+        payload.proxy_password = settings.authMode === authModes.none ? '' : String(settings.apiKey || '').trim();
+    }
+
+    const response = await fetch('/api/backends/chat-completions/status', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        cache: 'no-cache',
+        body: JSON.stringify(payload),
+    });
+    const raw = await response.text();
+    let data = null;
+    try {
+        data = raw ? JSON.parse(raw) : null;
+    } catch {
+        data = null;
+    }
+    if (!response.ok || data?.error) {
+        throw new Error(`酒馆内置通道拉取模型失败：${modelFetchError(data, raw, response.statusText)}`);
+    }
+    const models = normalizeFetchedModels(data);
+    if (!models.length) throw new Error('酒馆内置通道没有返回可用模型列表。');
+    return models;
+}
+
+async function requestModelsDirectly() {
+    const endpoint = normalizeModelsEndpoint();
+    if (!endpoint) throw new Error('请先填写副 API / 反代地址。');
+    const headers = buildHeaders(requestModes.standard);
+    delete headers['Content-Type'];
+    headers.Accept = 'application/json';
+
+    let response;
+    try {
+        response = await fetch(endpoint, {
+            method: 'GET',
+            headers,
+            cache: 'no-cache',
+        });
+    } catch (error) {
+        throw new Error(`直连拉取模型失败：${directFetchErrorMessage(error, endpoint)}`);
+    }
+
+    const raw = await response.text();
+    let data = null;
+    try {
+        data = raw ? JSON.parse(raw) : null;
+    } catch {
+        data = null;
+    }
+    if (!response.ok) {
+        throw new Error(`模型接口 ${response.status}: ${modelFetchError(data, raw, response.statusText)}`);
+    }
+    const models = normalizeFetchedModels(data);
+    if (!models.length) throw new Error('模型接口没有返回可用模型列表。');
+    return models;
+}
+
+async function fetchAvailableModels() {
+    if (settings.requestMode === requestModes.tavern) {
+        try {
+            return await requestModelsViaTavernBackend();
+        } catch (backendError) {
+            try {
+                return await requestModelsDirectly();
+            } catch (directError) {
+                throw new Error(`${backendError.message}；直连也失败：${directError.message}`);
+            }
+        }
+    }
+    return requestModelsDirectly();
+}
+
+async function fetchModelsForSettings() {
+    const $button = $('#stft_fetch_models');
+    const oldHtml = $button.html();
+    $button.addClass('disabled').html('<i class="fa-solid fa-spinner fa-spin"></i><span>拉取中...</span>');
+    $('#stft_global_status').text('正在拉取模型列表...');
+    try {
+        const models = await fetchAvailableModels();
+        settings.modelList = models;
+        if (!String(settings.model || '').trim() && models[0]) {
+            settings.model = models[0];
+            $('#stft_model').val(settings.model);
+        }
+        saveSettings();
+        refreshModelSelect();
+        $('#stft_global_status').text(`已拉取 ${models.length} 个模型。可以从“模型列表”选择，也可以继续手动填写。`);
+        toastr?.success?.(`已拉取 ${models.length} 个模型。`);
+    } catch (error) {
+        const message = error?.message || String(error);
+        $('#stft_global_status').text(`拉取模型失败：${message}`);
+        toastr?.error?.(message, '拉取模型失败');
+    } finally {
+        $button.removeClass('disabled').html(oldHtml);
+    }
 }
 
 async function testApi() {
@@ -4243,3 +4422,4 @@ async function init() {
 }
 
 jQuery(() => void init());
+
