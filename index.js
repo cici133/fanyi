@@ -648,6 +648,161 @@ function looksLikeJsCodeString(text) {
     return false;
 }
 
+function collectTemplateExpressionRanges(source) {
+    const text = String(source ?? '');
+    const ranges = [];
+    let index = 0;
+
+    while (index < text.length) {
+        const start = text.indexOf('${', index);
+        if (start === -1) break;
+        let cursor = start + 2;
+        let depth = 1;
+        let quote = '';
+        let escaped = false;
+        let lineComment = false;
+        let blockComment = false;
+
+        while (cursor < text.length && depth > 0) {
+            const char = text[cursor];
+            const next = text[cursor + 1];
+
+            if (lineComment) {
+                if (char === '\n') lineComment = false;
+                cursor += 1;
+                continue;
+            }
+            if (blockComment) {
+                if (char === '*' && next === '/') {
+                    blockComment = false;
+                    cursor += 2;
+                } else {
+                    cursor += 1;
+                }
+                continue;
+            }
+            if (quote) {
+                if (escaped) {
+                    escaped = false;
+                    cursor += 1;
+                    continue;
+                }
+                if (char === '\\') {
+                    escaped = true;
+                    cursor += 1;
+                    continue;
+                }
+                if (char === quote) quote = '';
+                cursor += 1;
+                continue;
+            }
+
+            if (char === '/' && next === '/') {
+                lineComment = true;
+                cursor += 2;
+                continue;
+            }
+            if (char === '/' && next === '*') {
+                blockComment = true;
+                cursor += 2;
+                continue;
+            }
+            if (char === "'" || char === '"' || char === '`') {
+                quote = char;
+                cursor += 1;
+                continue;
+            }
+            if (char === '{') {
+                depth += 1;
+            } else if (char === '}') {
+                depth -= 1;
+            }
+            cursor += 1;
+        }
+
+        ranges.push({ start, end: cursor });
+        index = Math.max(cursor, start + 2);
+    }
+
+    return ranges;
+}
+
+function addJsHtmlTextNode(nodes, rawContent, quote, absoluteContentStart, start, end) {
+    if (end <= start) return;
+    const raw = rawContent.slice(start, end);
+    const decoded = decodeJsStringLiteralContent(raw, quote);
+    if (!shouldTranslateRawHtmlText(decoded)) return;
+
+    const leading = decoded.match(/^\s*/)?.[0] ?? '';
+    const trailing = decoded.match(/\s*$/)?.[0] ?? '';
+    const core = decoded.slice(leading.length, decoded.length - trailing.length);
+    const source = decodeHtmlEntities(core).trim();
+    if (!source) return;
+
+    nodes.push({
+        start: absoluteContentStart + start,
+        end: absoluteContentStart + end,
+        source,
+        leading,
+        trailing,
+        rawContent: raw,
+        quote,
+        jsString: true,
+        htmlStringText: true,
+        replacement: null,
+    });
+}
+
+function collectJsHtmlFragmentTextNodes(rawContent, quote, absoluteContentStart) {
+    const source = String(rawContent ?? '');
+    if (!/<\/?[A-Za-z][\w:-]*(?:\s[^<>]*)?>/.test(source)) return [];
+
+    const ignoredTags = new Set(['script', 'style', 'code', 'pre', 'kbd', 'samp', 'textarea', 'svg', 'canvas', 'noscript']);
+    const nodes = [];
+    const ignoreStack = [];
+    const protectedRanges = quote === '`' ? collectTemplateExpressionRanges(source) : [];
+    const tagRegex = /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<![^>]*>|<\/?[A-Za-z][\w:-]*(?:\s[^<>]*)?>/g;
+    let cursor = 0;
+    let protectedIndex = 0;
+    let match;
+
+    const addTextRange = (start, end) => {
+        if (ignoreStack.length || end <= start) return;
+        let rangeStart = start;
+
+        while (protectedIndex < protectedRanges.length && protectedRanges[protectedIndex].end <= start) {
+            protectedIndex += 1;
+        }
+
+        let localIndex = protectedIndex;
+        while (localIndex < protectedRanges.length && protectedRanges[localIndex].start < end) {
+            const protectedRange = protectedRanges[localIndex];
+            addJsHtmlTextNode(nodes, source, quote, absoluteContentStart, rangeStart, Math.min(end, protectedRange.start));
+            rangeStart = Math.max(rangeStart, protectedRange.end);
+            localIndex += 1;
+        }
+        addJsHtmlTextNode(nodes, source, quote, absoluteContentStart, rangeStart, end);
+    };
+
+    while ((match = tagRegex.exec(source))) {
+        addTextRange(cursor, match.index);
+        const tagText = match[0];
+        const tagName = getRawHtmlTagName(tagText);
+        if (tagName && ignoredTags.has(tagName)) {
+            if (isRawHtmlClosingTag(tagText)) {
+                const index = ignoreStack.lastIndexOf(tagName);
+                if (index !== -1) ignoreStack.splice(index, 1);
+            } else if (!isRawHtmlSelfClosingTag(tagText)) {
+                ignoreStack.push(tagName);
+            }
+        }
+        cursor = match.index + tagText.length;
+    }
+
+    addTextRange(cursor, source.length);
+    return nodes;
+}
+
 function shouldTranslateJsStringLiteral(decoded, rawContent, quote, before, after) {
     const text = String(decoded ?? '').trim();
     if (!shouldTranslateRawHtmlText(text)) return false;
@@ -741,7 +896,10 @@ function collectJsStringTextNodes(scriptSource, absoluteOffset) {
         const before = source.slice(Math.max(0, literalStart - 160), literalStart);
         const after = source.slice(index + 1, Math.min(source.length, index + 120));
         const decoded = decodeJsStringLiteralContent(rawContent, quote);
-        if (shouldTranslateJsStringLiteral(decoded, rawContent, quote, before, after)) {
+        const htmlTextNodes = collectJsHtmlFragmentTextNodes(rawContent, quote, absoluteOffset + contentStart);
+        if (htmlTextNodes.length) {
+            nodes.push(...htmlTextNodes);
+        } else if (shouldTranslateJsStringLiteral(decoded, rawContent, quote, before, after)) {
             const leading = decoded.match(/^\s*/)?.[0] ?? '';
             const trailing = decoded.match(/\s*$/)?.[0] ?? '';
             const core = decoded.slice(leading.length, decoded.length - trailing.length);
