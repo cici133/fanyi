@@ -54,8 +54,8 @@ const googleChunkLength = 1300;
 const googleBatchMaxSegments = 18;
 const googleBatchMaxChars = googleChunkLength;
 const googleBatchMarkerRegex = /\s*⟦\s*\d{6}\s*⟧\s*/gu;
-const aiBatchMaxSegments = 360;
-const aiBatchMaxChars = 22000;
+const aiBatchMaxSegments = 320;
+const aiBatchMaxChars = 20000;
 const aiRateLimitRetryDelays = [1800, 4200, 9000];
 
 const languages = [
@@ -3265,6 +3265,9 @@ function directFetchErrorMessage(error, endpoint) {
 function compactHttpError(raw, fallback = '请求失败') {
     const value = String(raw || fallback || '').trim();
     if (!value) return fallback;
+    if (/\b524\b|a timeout occurred|origin web server timed out|timed out responding/i.test(value)) {
+        return 'Cloudflare 524：请求已经到达服务器，但源站/模型太久没有返回。扩展会对分批翻译自动拆小重试；如果单段仍超时，需要换更快的副 API 或缩短单段内容。';
+    }
     if (/^\s*<!doctype html|<html[\s>]/i.test(value)) {
         return '服务器返回 HTML 错误页，通常是网页翻译端点拒绝了这次请求、文本过长，或网络代理改写了请求。';
     }
@@ -3820,7 +3823,7 @@ async function requestTranslationText(sourceText, options, onProgress) {
 
         if (!response.ok) {
             const messageText = data?.error?.message || text || response.statusText;
-            throw new Error(`API ${response.status}: ${messageText}`);
+            throw new Error(`API ${response.status}: ${compactHttpError(messageText, response.statusText)}`);
         }
         if (data?.error) {
             const messageText = data?.error?.message || data?.error || text || '未知错误';
@@ -3834,14 +3837,14 @@ async function requestTranslationText(sourceText, options, onProgress) {
         return parseTranslationResponse(translated, sourceText, options.language, segmentsForRequest, planForParse);
     };
 
-    const sendStreamAndParse = async (forceTranslate = false, segmentsForRequest = sourceSegments, planForParse = htmlPlan) => {
-        const body = buildBody(forceTranslate, true, segmentsForRequest);
+    const sendStreamAndParse = async (forceTranslate = false, segmentsForRequest = sourceSegments, planForParse = htmlPlan, compact = false, reportProgress = true) => {
+        const body = buildBody(forceTranslate, true, segmentsForRequest, compact);
         const response = settings.requestMode === requestModes.tavern
             ? await requestViaTavernBackend(endpoint, body)
             : await requestDirectly(endpoint, body);
 
         let lastProgressText = '';
-        const rawText = await readChatCompletionStream(response, partialText => {
+        const rawText = await readChatCompletionStream(response, reportProgress ? partialText => {
             const parsed = parsePartialTranslationProgress(partialText, sourceText, options.language, segmentsForRequest, planForParse);
             if (parsed.text && parsed.text !== lastProgressText) {
                 lastProgressText = parsed.text;
@@ -3852,7 +3855,7 @@ async function requestTranslationText(sourceText, options, onProgress) {
                     channel: translationChannels.ai,
                 });
             }
-        });
+        } : null);
 
         if (!String(rawText).trim()) {
             throw new Error('API 流式响应结束了，但没有拿到译文内容。');
@@ -3862,11 +3865,21 @@ async function requestTranslationText(sourceText, options, onProgress) {
 
     const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
     const isRateLimitError = error => /(?:\b429\b|too many requests|rate limit|限速|频率)/i.test(error?.message || String(error));
+    const isTimeoutError = error => /(?:\b524\b|timeout|timed out|超时)/i.test(error?.message || String(error));
+    const combineBatchResults = results => ({
+        text: results.map(result => result?.text || '').filter(Boolean).join('\n\n').trim(),
+        segments: results.flatMap(result => result?.segments || []),
+        raw: results.map(result => result?.raw || '').filter(Boolean).join('\n\n').trim(),
+        usedFallback: results.some(result => result?.usedFallback),
+        looksUntranslated: results.some(result => result?.looksUntranslated),
+        missingTranslationCount: results.reduce((sum, result) => sum + Number(result?.missingTranslationCount || 0), 0),
+    });
+
     const sendBatchWithRateLimitRetry = async (batch, forceTranslate = false) => {
         let lastError = null;
         for (let attempt = 0; attempt <= aiRateLimitRetryDelays.length; attempt += 1) {
             try {
-                return await sendAndParse(forceTranslate, batch, null, true);
+                return await sendStreamAndParse(forceTranslate, batch, null, true, false);
             } catch (error) {
                 lastError = error;
                 if (!isRateLimitError(error) || attempt >= aiRateLimitRetryDelays.length) {
@@ -3876,6 +3889,21 @@ async function requestTranslationText(sourceText, options, onProgress) {
             }
         }
         throw lastError;
+    };
+
+    const sendBatchAdaptive = async (batch, forceTranslate = false) => {
+        try {
+            return await sendBatchWithRateLimitRetry(batch, forceTranslate);
+        } catch (error) {
+            if (!isTimeoutError(error) || batch.length <= 1) {
+                throw error;
+            }
+
+            const middle = Math.ceil(batch.length / 2);
+            const left = await sendBatchAdaptive(batch.slice(0, middle), forceTranslate);
+            const right = await sendBatchAdaptive(batch.slice(middle), forceTranslate);
+            return combineBatchResults([left, right]);
+        }
     };
 
     const sendBatchedAndParse = async () => {
@@ -3927,9 +3955,9 @@ async function requestTranslationText(sourceText, options, onProgress) {
         };
 
         for (const batch of batches) {
-            let batchResult = await sendBatchWithRateLimitRetry(batch, false);
+            let batchResult = await sendBatchAdaptive(batch, false);
             if (batchResult.looksUntranslated || batchResult.missingTranslationCount) {
-                batchResult = await sendBatchWithRateLimitRetry(batch, true);
+                batchResult = await sendBatchAdaptive(batch, true);
                 batchResult.retriedForCopy = true;
             }
             if (batchResult.looksUntranslated) {
