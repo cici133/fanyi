@@ -220,6 +220,7 @@ const inFlight = new Map();
 const liveTranslations = new Map();
 const mutedLiveDisplays = new Set();
 const originalRenderCache = new Map();
+const translatedIframeObservers = new WeakMap();
 
 function clone(value) {
     return JSON.parse(JSON.stringify(value));
@@ -2237,6 +2238,17 @@ function buildHtmlSegmentQueues(htmlSegments) {
     return queues;
 }
 
+function buildHtmlSegmentLookup(htmlSegments) {
+    const lookup = new Map();
+    for (const segment of htmlSegments || []) {
+        const sourceKey = normalizeHtmlTextForMatch(segment.source);
+        const translation = String(segment.translation ?? segment.text ?? '').trim();
+        if (!sourceKey || !translation) continue;
+        if (!lookup.has(sourceKey)) lookup.set(sourceKey, translation);
+    }
+    return lookup;
+}
+
 function buildHtmlRestoreQueues(htmlSegments) {
     const queues = new Map();
     for (const segment of htmlSegments || []) {
@@ -2266,11 +2278,43 @@ function stabilizeTranslatedIframeLayout(iframe) {
     }
     style.textContent = `
 html,
-body {
+    body {
     min-height: 0 !important;
     height: auto !important;
 }
 `;
+}
+
+function applyHtmlSegmentsToDocument(doc, htmlSegments, options = {}) {
+    if (!doc?.body) return false;
+    const queues = buildHtmlSegmentQueues(htmlSegments);
+    const lookup = options.repeat ? buildHtmlSegmentLookup(htmlSegments) : null;
+    if (!queues.size && !lookup?.size) return false;
+
+    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+            return shouldTranslateRenderedIframeTextNode(node)
+                ? NodeFilter.FILTER_ACCEPT
+                : NodeFilter.FILTER_REJECT;
+        },
+    });
+
+    let changed = false;
+    let node;
+    while ((node = walker.nextNode())) {
+        const raw = String(node.nodeValue ?? '');
+        const leading = raw.match(/^\s*/)?.[0] ?? '';
+        const trailing = raw.match(/\s*$/)?.[0] ?? '';
+        const core = raw.slice(leading.length, raw.length - trailing.length);
+        const key = normalizeHtmlTextForMatch(core);
+        const queue = queues.get(key);
+        const translation = queue?.shift() || lookup?.get(key);
+        if (!translation) continue;
+        node.nodeValue = `${leading}${translation}${trailing}`;
+        changed = true;
+    }
+
+    return changed;
 }
 
 function resizeTranslatedIframe(iframe) {
@@ -2305,10 +2349,68 @@ function removeTranslatedIframeLayout(iframe) {
     }
 }
 
-function applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey) {
-    const queues = buildHtmlSegmentQueues(htmlSegments);
-    if (!queues.size) return false;
+function disconnectTranslatedIframeObserver(iframe) {
+    const state = translatedIframeObservers.get(iframe);
+    if (!state) return;
+    try {
+        state.observer?.disconnect?.();
+    } catch {
+        // Ignore stale iframe observer cleanup failures.
+    }
+    if (state.timer) {
+        window.clearTimeout(state.timer);
+    }
+    translatedIframeObservers.delete(iframe);
+}
 
+function installTranslatedIframeObserver(iframe, htmlSegments, renderKey) {
+    let doc;
+    try {
+        doc = iframe.contentDocument;
+    } catch {
+        return;
+    }
+    if (!doc?.body || typeof MutationObserver === 'undefined') return;
+
+    const existing = translatedIframeObservers.get(iframe);
+    if (existing?.renderKey === renderKey) return;
+    disconnectTranslatedIframeObserver(iframe);
+
+    const state = {
+        renderKey,
+        timer: 0,
+        observer: null,
+    };
+    const patch = () => {
+        state.timer = 0;
+        if (iframe.dataset.stftTranslationKey !== renderKey) return;
+        let frameDoc;
+        try {
+            frameDoc = iframe.contentDocument;
+        } catch {
+            return;
+        }
+        const changed = applyHtmlSegmentsToDocument(frameDoc, htmlSegments, { repeat: true });
+        if (changed) {
+            stabilizeTranslatedIframeLayout(iframe);
+            scheduleTranslatedIframeResize(iframe);
+        }
+    };
+    const schedulePatch = () => {
+        if (state.timer) return;
+        state.timer = window.setTimeout(patch, 40);
+    };
+
+    state.observer = new MutationObserver(schedulePatch);
+    state.observer.observe(doc.body, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+    });
+    translatedIframeObservers.set(iframe, state);
+}
+
+function applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey) {
     let doc;
     try {
         doc = iframe.contentDocument;
@@ -2317,32 +2419,11 @@ function applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey) {
     }
     if (!doc?.body) return false;
 
-    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
-        acceptNode(node) {
-            return shouldTranslateRenderedIframeTextNode(node)
-                ? NodeFilter.FILTER_ACCEPT
-                : NodeFilter.FILTER_REJECT;
-        },
-    });
-
-    let changed = false;
-    let node;
-    while ((node = walker.nextNode())) {
-        const raw = String(node.nodeValue ?? '');
-        const leading = raw.match(/^\s*/)?.[0] ?? '';
-        const trailing = raw.match(/\s*$/)?.[0] ?? '';
-        const core = raw.slice(leading.length, raw.length - trailing.length);
-        const key = normalizeHtmlTextForMatch(core);
-        const queue = queues.get(key);
-        const translation = queue?.shift();
-        if (!translation) continue;
-        node.nodeValue = `${leading}${translation}${trailing}`;
-        changed = true;
-    }
-
+    const changed = applyHtmlSegmentsToDocument(doc, htmlSegments, { repeat: false });
     if (!changed) return false;
     stabilizeTranslatedIframeLayout(iframe);
     iframe.dataset.stftTranslationKey = renderKey;
+    installTranslatedIframeObserver(iframe, htmlSegments, renderKey);
     scheduleTranslatedIframeResize(iframe);
     return true;
 }
@@ -2358,6 +2439,7 @@ function restoreHtmlSegmentsInRenderedIframe(iframe, htmlSegments) {
         return false;
     }
     if (!doc?.body) return false;
+    disconnectTranslatedIframeObserver(iframe);
 
     const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
         acceptNode(node) {
@@ -2382,9 +2464,9 @@ function restoreHtmlSegmentsInRenderedIframe(iframe, htmlSegments) {
         changed = true;
     }
 
-    if (!changed) return false;
     delete iframe.dataset.stftTranslationKey;
     removeTranslatedIframeLayout(iframe);
+    if (!changed) return false;
     return true;
 }
 
@@ -2411,6 +2493,8 @@ function applyRenderedHtmlDocumentDisplay(messageId, htmlSegments, renderKey) {
     const $text = getMessageElement(messageId).find('.mes_text').first();
     if (!$text.length) return false;
     if (hasRenderedIframeTranslation($text, renderKey)) {
+        const translatedIframe = findRenderedHtmlIframe($text);
+        if (translatedIframe) installTranslatedIframeObserver(translatedIframe, htmlSegments, renderKey);
         prependInlineToggleIfNeeded(messageId, $text, true, true);
         $text.attr('data-stft-render-key', renderKey);
         return true;
