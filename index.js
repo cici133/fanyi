@@ -596,6 +596,184 @@ function shouldTranslateRawHtmlText(value) {
     return true;
 }
 
+function decodeJsStringLiteralContent(value, quote) {
+    const text = String(value ?? '');
+    try {
+        if (quote === '`') {
+            return text
+                .replace(/\\`/g, '`')
+                .replace(/\\\$/g, '$')
+                .replace(/\\n/g, '\n')
+                .replace(/\\r/g, '\r')
+                .replace(/\\t/g, '\t')
+                .replace(/\\\\/g, '\\');
+        }
+        return JSON.parse(`${quote}${text.replace(new RegExp(quote, 'g'), `\\${quote}`)}${quote}`);
+    } catch {
+        return text
+            .replace(/\\n/g, '\n')
+            .replace(/\\r/g, '\r')
+            .replace(/\\t/g, '\t')
+            .replace(/\\'/g, "'")
+            .replace(/\\"/g, '"')
+            .replace(/\\\\/g, '\\');
+    }
+}
+
+function encodeJsStringLiteralContent(value, quote) {
+    const text = String(value ?? '');
+    if (quote === '`') {
+        return text
+            .replace(/\\/g, '\\\\')
+            .replace(/`/g, '\\`')
+            .replace(/\$\{/g, '\\${')
+            .replace(/\r/g, '\\r')
+            .replace(/\n/g, '\\n');
+    }
+    const json = JSON.stringify(text).slice(1, -1);
+    return quote === "'" ? json.replace(/'/g, "\\'") : json;
+}
+
+function looksLikeJsCodeString(text) {
+    const value = String(text ?? '').trim();
+    if (!value) return true;
+    if (/^(?:https?:|data:|mailto:|tel:)/i.test(value)) return true;
+    if (/^#[0-9a-f]{3,8}$/i.test(value)) return true;
+    if (/^[.#]?[A-Za-z_][\w:-]*$/.test(value) && value === value.toLowerCase()) return true;
+    if (/^(?:none|block|inline|inline-block|flex|grid|absolute|relative|fixed|static|hidden|visible)$/i.test(value)) return true;
+    if (/^[\w.-]+\s+\.?\d+s$/i.test(value)) return true;
+    if (/^[A-Z]{1,5}$/.test(value)) return true;
+    if (/^[\d\s./:%+-]+$/.test(value)) return true;
+    if (/<[A-Za-z][\s\S]*>/.test(value)) return true;
+    return false;
+}
+
+function shouldTranslateJsStringLiteral(decoded, rawContent, quote, before, after) {
+    const text = String(decoded ?? '').trim();
+    if (!shouldTranslateRawHtmlText(text)) return false;
+    if (quote === '`' && /\$\{/.test(rawContent)) return false;
+    if (looksLikeJsCodeString(text)) return false;
+
+    const prefix = String(before ?? '').slice(-140);
+    if (/getElementById\s*\(\s*$/i.test(prefix)) return false;
+    if (/querySelector(?:All)?\s*\(\s*$/i.test(prefix)) return false;
+    if (/createElement\s*\(\s*$/i.test(prefix)) return false;
+    if (/classList\.(?:add|remove|toggle|contains)\s*\([^)]*$/i.test(prefix)) return false;
+    if (/(?:className|id|style\.[\w-]+|style)\s*=\s*$/i.test(prefix)) return false;
+    if (/(?:===|!==|==|!=)\s*$/i.test(prefix) && text.length <= 8) return false;
+
+    const suffix = String(after ?? '').slice(0, 80);
+    if (/^\s*\)/.test(suffix) && /^[a-z][\w-]*$/i.test(text) && text.length <= 12) return false;
+    return true;
+}
+
+function collectJsStringTextNodes(scriptSource, absoluteOffset) {
+    const source = String(scriptSource ?? '');
+    const nodes = [];
+    let index = 0;
+    let mode = 'code';
+
+    while (index < source.length) {
+        const char = source[index];
+        const next = source[index + 1];
+
+        if (mode === 'lineComment') {
+            if (char === '\n') mode = 'code';
+            index += 1;
+            continue;
+        }
+        if (mode === 'blockComment') {
+            if (char === '*' && next === '/') {
+                mode = 'code';
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+
+        if (char === '/' && next === '/') {
+            mode = 'lineComment';
+            index += 2;
+            continue;
+        }
+        if (char === '/' && next === '*') {
+            mode = 'blockComment';
+            index += 2;
+            continue;
+        }
+        if (char !== "'" && char !== '"' && char !== '`') {
+            index += 1;
+            continue;
+        }
+
+        const quote = char;
+        const literalStart = index;
+        const contentStart = index + 1;
+        index += 1;
+        let escaped = false;
+        let rawContent = '';
+        let closed = false;
+
+        while (index < source.length) {
+            const current = source[index];
+            if (escaped) {
+                rawContent += `\\${current}`;
+                escaped = false;
+                index += 1;
+                continue;
+            }
+            if (current === '\\') {
+                escaped = true;
+                index += 1;
+                continue;
+            }
+            if (current === quote) {
+                closed = true;
+                break;
+            }
+            rawContent += current;
+            index += 1;
+        }
+
+        if (!closed) break;
+        const contentEnd = index;
+        const before = source.slice(Math.max(0, literalStart - 160), literalStart);
+        const after = source.slice(index + 1, Math.min(source.length, index + 120));
+        const decoded = decodeJsStringLiteralContent(rawContent, quote);
+        if (shouldTranslateJsStringLiteral(decoded, rawContent, quote, before, after)) {
+            const leading = decoded.match(/^\s*/)?.[0] ?? '';
+            const trailing = decoded.match(/\s*$/)?.[0] ?? '';
+            const core = decoded.slice(leading.length, decoded.length - trailing.length);
+            if (core.trim()) {
+                nodes.push({
+                    start: absoluteOffset + contentStart,
+                    end: absoluteOffset + contentEnd,
+                    source: core,
+                    leading,
+                    trailing,
+                    rawContent,
+                    quote,
+                    jsString: true,
+                    replacement: null,
+                });
+            }
+        }
+        index += 1;
+    }
+    return nodes;
+}
+
+function addScriptStringTextNodes(source, textNodes) {
+    const scriptRegex = /<script\b[^>]*>([\s\S]*?)<\/script\s*>/gi;
+    let match;
+    while ((match = scriptRegex.exec(source))) {
+        const openTag = match[0].match(/^<script\b[^>]*>/i)?.[0] || '';
+        const contentStart = match.index + openTag.length;
+        textNodes.push(...collectJsStringTextNodes(match[1], contentStart));
+    }
+}
+
 function getRawHtmlTagName(tagText) {
     const match = String(tagText ?? '').match(/^<\s*\/?\s*([A-Za-z][\w:-]*)/);
     return match ? match[1].toLowerCase() : '';
@@ -656,6 +834,8 @@ function createRawHtmlBlockState(html) {
     }
 
     addTextRange(cursor, source.length);
+    addScriptStringTextNodes(source, textNodes);
+    textNodes.sort((a, b) => a.start - b.start);
     if (!textNodes.length) return null;
     return {
         source,
@@ -856,6 +1036,11 @@ function applyHtmlTranslationPlan(plan, translatedSegments = []) {
             const translated = String(translation || '').trim();
             if (textNode.node) {
                 textNode.node.nodeValue = `${textNode.leading}${translated || textNode.source}${textNode.trailing}`;
+            } else if (textNode.jsString) {
+                const text = translated ? `${textNode.leading}${translated}${textNode.trailing}` : `${textNode.leading}${textNode.source}${textNode.trailing}`;
+                textNode.replacement = translated
+                    ? encodeJsStringLiteralContent(text, textNode.quote)
+                    : textNode.rawContent;
             } else {
                 textNode.replacement = translated
                     ? `${textNode.leading}${escapeHtml(translated)}${textNode.trailing}`
@@ -2460,7 +2645,7 @@ function buildMessages(sourceText, language, presetId, sourceSegments = getSourc
             '每个返回对象只允许包含 id 和 translation，不要返回 source_text、text、source 或原始字段。',
             'translation 必须是 source_text 的译文，不是对 source_text 的复制。',
             `只有某段本来就已经是${targetLanguage}，或者它只是专名、代码、标记、章节编号等不应翻译内容时，才可以原样复制。`,
-            isHtmlNodeMode ? '这些 segments 来自 HTML 美化界面的可见文本节点。只翻译 source_text 的自然语言文字，不要返回 HTML 标签、属性、CSS、JavaScript 或 Markdown 代码块。' : '',
+            isHtmlNodeMode ? '这些 segments 来自 HTML 美化界面的可见文本节点，或来自脚本里运行时会显示到界面的自然语言文案。只翻译 source_text 的自然语言文字，不要返回 HTML 标签、属性、CSS、JavaScript 或 Markdown 代码块。' : '',
             isRenderedDomMode ? 'These segments come from an already-rendered SillyTavern chat display after Regex/display replacements. Translate only the visible natural-language text in source_text. Do not return HTML, CSS, JavaScript, Markdown fences, regex trigger syntax, or wrapper markup.' : '',
             forceTranslate ? `上一轮返回疑似照抄原文。请重新翻译，普通叙事和对话必须变成${targetLanguage}。` : '',
         ].filter(Boolean),
@@ -4422,4 +4607,6 @@ async function init() {
 }
 
 jQuery(() => void init());
+
+
 
