@@ -54,6 +54,8 @@ const googleChunkLength = 1300;
 const googleBatchMaxSegments = 18;
 const googleBatchMaxChars = googleChunkLength;
 const googleBatchMarkerRegex = /\s*⟦\s*\d{6}\s*⟧\s*/gu;
+const aiBatchMaxSegments = 32;
+const aiBatchMaxChars = 6500;
 
 const languages = [
     ['auto', '自动识别'],
@@ -803,6 +805,66 @@ function collectJsHtmlFragmentTextNodes(rawContent, quote, absoluteContentStart)
     return nodes;
 }
 
+function isJsDelimitedMetaSegment(value) {
+    const text = String(value ?? '').trim();
+    if (!text) return false;
+    return /^(?:[A-Za-z_][\w-]*:-?\d+(?:\.\d+)?)(?:\s*,\s*[A-Za-z_][\w-]*:-?\d+(?:\.\d+)?)*$/.test(text);
+}
+
+function addJsDelimitedDisplayPart(nodes, rawContent, quote, absoluteContentStart, start, end) {
+    if (end <= start) return;
+    const raw = rawContent.slice(start, end);
+    const htmlNodes = collectJsHtmlFragmentTextNodes(raw, quote, absoluteContentStart + start);
+    if (htmlNodes.length) {
+        nodes.push(...htmlNodes);
+        return;
+    }
+    addJsHtmlTextNode(nodes, rawContent, quote, absoluteContentStart, start, end);
+}
+
+function collectJsDelimitedTextNodes(rawContent, quote, absoluteContentStart) {
+    const source = String(rawContent ?? '');
+    const firstPipe = source.indexOf('|');
+    if (firstPipe <= 0) return [];
+    const secondPipe = source.indexOf('|', firstPipe + 1);
+    if (secondPipe <= firstPipe + 1) return [];
+
+    const meta = source.slice(firstPipe + 1, secondPipe);
+    if (!isJsDelimitedMetaSegment(meta)) return [];
+
+    let feedbackEnd = source.length;
+    const thirdPipe = source.indexOf('|', secondPipe + 1);
+    if (thirdPipe !== -1) {
+        const tail = source.slice(thirdPipe + 1).trim();
+        if (/^egg:[A-Za-z0-9_-]+$/.test(tail)) {
+            feedbackEnd = thirdPipe;
+        } else {
+            return [];
+        }
+    }
+
+    const nodes = [];
+    addJsDelimitedDisplayPart(nodes, source, quote, absoluteContentStart, 0, firstPipe);
+    addJsDelimitedDisplayPart(nodes, source, quote, absoluteContentStart, secondPipe + 1, feedbackEnd);
+    return nodes;
+}
+
+function collectJsTemplateStaticTextNodes(rawContent, quote, absoluteContentStart, before) {
+    if (quote !== '`' || !/\$\{/.test(rawContent)) return [];
+    const prefix = String(before ?? '').slice(-120);
+    if (!/(?:textContent|innerText|ariaLabel|title)\s*=\s*$/i.test(prefix)) return [];
+
+    const ranges = collectTemplateExpressionRanges(rawContent);
+    const nodes = [];
+    let cursor = 0;
+    for (const range of ranges) {
+        addJsHtmlTextNode(nodes, rawContent, quote, absoluteContentStart, cursor, range.start);
+        cursor = range.end;
+    }
+    addJsHtmlTextNode(nodes, rawContent, quote, absoluteContentStart, cursor, rawContent.length);
+    return nodes;
+}
+
 function shouldTranslateJsStringLiteral(decoded, rawContent, quote, before, after) {
     const text = String(decoded ?? '').trim();
     if (!shouldTranslateRawHtmlText(text)) return false;
@@ -896,9 +958,17 @@ function collectJsStringTextNodes(scriptSource, absoluteOffset) {
         const before = source.slice(Math.max(0, literalStart - 160), literalStart);
         const after = source.slice(index + 1, Math.min(source.length, index + 120));
         const decoded = decodeJsStringLiteralContent(rawContent, quote);
-        const htmlTextNodes = collectJsHtmlFragmentTextNodes(rawContent, quote, absoluteOffset + contentStart);
+        const delimitedTextNodes = collectJsDelimitedTextNodes(rawContent, quote, absoluteOffset + contentStart);
+        const htmlTextNodes = delimitedTextNodes.length
+            ? delimitedTextNodes
+            : collectJsHtmlFragmentTextNodes(rawContent, quote, absoluteOffset + contentStart);
+        const templateTextNodes = htmlTextNodes.length
+            ? []
+            : collectJsTemplateStaticTextNodes(rawContent, quote, absoluteOffset + contentStart, before);
         if (htmlTextNodes.length) {
             nodes.push(...htmlTextNodes);
+        } else if (templateTextNodes.length) {
+            nodes.push(...templateTextNodes);
         } else if (shouldTranslateJsStringLiteral(decoded, rawContent, quote, before, after)) {
             const leading = decoded.match(/^\s*/)?.[0] ?? '';
             const trailing = decoded.match(/\s*$/)?.[0] ?? '';
@@ -3297,6 +3367,42 @@ function parsePartialTranslationProgress(rawText, sourceText, targetLanguage, so
     };
 }
 
+function makeAiSegmentBatches(segments) {
+    const batches = [];
+    let current = [];
+    let currentLength = 0;
+
+    const pushCurrent = () => {
+        if (current.length) batches.push(current);
+        current = [];
+        currentLength = 0;
+    };
+
+    for (const segment of segments || []) {
+        const source = String(segment?.source ?? '');
+        const nextLength = currentLength + source.length;
+        const tooManySegments = current.length >= aiBatchMaxSegments;
+        const tooLong = current.length && nextLength > aiBatchMaxChars;
+
+        if (tooManySegments || tooLong) {
+            pushCurrent();
+        }
+
+        current.push(segment);
+        currentLength += source.length;
+    }
+
+    pushCurrent();
+    return batches;
+}
+
+function shouldBatchAiSegments(segments) {
+    const list = Array.isArray(segments) ? segments : [];
+    if (list.length > aiBatchMaxSegments) return true;
+    const totalLength = list.reduce((sum, segment) => sum + String(segment?.source ?? '').length, 0);
+    return totalLength > aiBatchMaxChars;
+}
+
 function getMachineSourceCode(channel) {
     const source = getMachineLanguageCode(settings.sourceLanguage, channel);
     return source === 'auto' || !source ? 'auto' : source;
@@ -3584,10 +3690,10 @@ async function requestTranslationText(sourceText, options, onProgress) {
     const htmlPlan = createTranslationPlan(sourceText, options.messageId);
     const sourceSegments = htmlPlan?.segments || getSourceSegments(sourceText);
 
-    const buildBody = (forceTranslate = false, stream = false) => {
+    const buildBody = (forceTranslate = false, stream = false, segmentsForRequest = sourceSegments) => {
         const body = {
             model: settings.model,
-            messages: buildMessages(sourceText, options.language, options.presetId, sourceSegments, forceTranslate),
+            messages: buildMessages(sourceText, options.language, options.presetId, segmentsForRequest, forceTranslate),
             temperature: Number(settings.temperature) || 0,
             stream,
         };
@@ -3598,8 +3704,8 @@ async function requestTranslationText(sourceText, options, onProgress) {
         return body;
     };
 
-    const sendAndParse = async (forceTranslate = false) => {
-        const body = buildBody(forceTranslate);
+    const sendAndParse = async (forceTranslate = false, segmentsForRequest = sourceSegments, planForParse = htmlPlan) => {
+        const body = buildBody(forceTranslate, false, segmentsForRequest);
         const response = settings.requestMode === requestModes.tavern
             ? await requestViaTavernBackend(endpoint, body)
             : await requestDirectly(endpoint, body);
@@ -3625,24 +3731,24 @@ async function requestTranslationText(sourceText, options, onProgress) {
         if (!String(translated).trim()) {
             throw new Error('API 返回成功，但没有找到译文内容。');
         }
-        return parseTranslationResponse(translated, sourceText, options.language, sourceSegments, htmlPlan);
+        return parseTranslationResponse(translated, sourceText, options.language, segmentsForRequest, planForParse);
     };
 
-    const sendStreamAndParse = async (forceTranslate = false) => {
-        const body = buildBody(forceTranslate, true);
+    const sendStreamAndParse = async (forceTranslate = false, segmentsForRequest = sourceSegments, planForParse = htmlPlan) => {
+        const body = buildBody(forceTranslate, true, segmentsForRequest);
         const response = settings.requestMode === requestModes.tavern
             ? await requestViaTavernBackend(endpoint, body)
             : await requestDirectly(endpoint, body);
 
         let lastProgressText = '';
         const rawText = await readChatCompletionStream(response, partialText => {
-            const parsed = parsePartialTranslationProgress(partialText, sourceText, options.language, sourceSegments, htmlPlan);
+            const parsed = parsePartialTranslationProgress(partialText, sourceText, options.language, segmentsForRequest, planForParse);
             if (parsed.text && parsed.text !== lastProgressText) {
                 lastProgressText = parsed.text;
                 onProgress?.({
                     ...parsed,
                     completed: parsed.completed ?? parsed.segments.filter(segment => String(segment.translation || '').trim()).length,
-                    total: sourceSegments.length,
+                    total: segmentsForRequest.length,
                     channel: translationChannels.ai,
                 });
             }
@@ -3651,8 +3757,86 @@ async function requestTranslationText(sourceText, options, onProgress) {
         if (!String(rawText).trim()) {
             throw new Error('API 流式响应结束了，但没有拿到译文内容。');
         }
-        return parseTranslationResponse(rawText, sourceText, options.language, sourceSegments, htmlPlan);
+        return parseTranslationResponse(rawText, sourceText, options.language, segmentsForRequest, planForParse);
     };
+
+    const sendBatchedAndParse = async () => {
+        const batches = makeAiSegmentBatches(sourceSegments);
+        const resultSegments = sourceSegments.map(segment => ({
+            id: segment.id,
+            source: segment.source,
+            kind: segment.kind,
+            translation: '',
+        }));
+        let usedFallback = false;
+
+        const applyBatchResult = batchResult => {
+            const byId = new Map((batchResult?.segments || []).map(segment => [Number(segment.id), segment]));
+            for (const target of resultSegments) {
+                const translated = byId.get(Number(target.id));
+                if (translated) {
+                    target.translation = String(translated.translation ?? '').trim();
+                }
+            }
+            usedFallback = usedFallback || Boolean(batchResult?.usedFallback);
+        };
+
+        const makeFullResult = (raw = '') => {
+            if (htmlPlan) {
+                return makePlannedTranslationResult(htmlPlan, resultSegments, options.language, raw, usedFallback);
+            }
+            const text = resultSegments.map(segment => segment.translation || '').filter(Boolean).join('\n\n').trim();
+            const missingTranslationCount = resultSegments.filter(segment => !String(segment.translation ?? '').trim()).length;
+            return {
+                text,
+                segments: resultSegments.map(segment => ({ ...segment })),
+                raw: String(raw ?? '').trim(),
+                usedFallback,
+                looksUntranslated: isProbablyUntranslated(resultSegments, options.language),
+                missingTranslationCount,
+            };
+        };
+
+        const emitProgress = () => {
+            if (options.progressMode !== progressModes.stream || typeof onProgress !== 'function') return;
+            const progressResult = makeFullResult('');
+            onProgress({
+                ...progressResult,
+                completed: resultSegments.filter(segment => String(segment.translation || '').trim()).length,
+                total: sourceSegments.length,
+                channel: translationChannels.ai,
+            });
+        };
+
+        for (const batch of batches) {
+            let batchResult = await sendAndParse(false, batch, null);
+            if (batchResult.looksUntranslated || batchResult.missingTranslationCount) {
+                batchResult = await sendAndParse(true, batch, null);
+                batchResult.retriedForCopy = true;
+            }
+            if (batchResult.looksUntranslated) {
+                throw new Error('模型返回的译文仍然基本等于原文，已拦截保存。请确认目标语言，并把提示词预设改回内置预设后刷新翻译。');
+            }
+            if (batchResult.missingTranslationCount) {
+                throw new Error('API 分批返回内容里有段落没有拿到有效 translation 字段，已拦截保存。请点“刷新翻译”重试一次，或换一个更听 JSON 指令的模型。');
+            }
+            applyBatchResult(batchResult);
+            emitProgress();
+        }
+
+        const finalResult = makeFullResult('');
+        if (finalResult.looksUntranslated) {
+            throw new Error('模型返回的译文仍然基本等于原文，已拦截保存。请确认目标语言，并把提示词预设改回内置预设后刷新翻译。');
+        }
+        if (finalResult.missingTranslationCount) {
+            throw new Error('API 分批返回完成后仍有段落缺少译文，已拦截保存。请点“刷新翻译”重试一次。');
+        }
+        return finalResult;
+    };
+
+    if (shouldBatchAiSegments(sourceSegments)) {
+        return sendBatchedAndParse();
+    }
 
     if (options.progressMode === progressModes.stream && typeof onProgress === 'function') {
         let result = await sendStreamAndParse(false);
