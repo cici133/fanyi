@@ -54,8 +54,9 @@ const googleChunkLength = 1300;
 const googleBatchMaxSegments = 18;
 const googleBatchMaxChars = googleChunkLength;
 const googleBatchMarkerRegex = /\s*⟦\s*\d{6}\s*⟧\s*/gu;
-const aiBatchMaxSegments = 32;
-const aiBatchMaxChars = 6500;
+const aiBatchMaxSegments = 360;
+const aiBatchMaxChars = 22000;
+const aiRateLimitRetryDelays = [1800, 4200, 9000];
 
 const languages = [
     ['auto', '自动识别'],
@@ -2938,7 +2939,7 @@ function replacePromptVars(text, language, sourceLanguage) {
         .replace(/\{\{source_language\}\}/g, sourceLanguage || '自动识别');
 }
 
-function buildMessages(sourceText, language, presetId, sourceSegments = getSourceSegments(sourceText), forceTranslate = false) {
+function buildMessages(sourceText, language, presetId, sourceSegments = getSourceSegments(sourceText), forceTranslate = false, compact = false) {
     const sourceLanguage = settings.sourceLanguage === 'auto' ? '自动识别' : getLanguagePromptName(settings.sourceLanguage);
     const targetLanguage = getLanguagePromptName(language);
     const prompt = getPromptById(presetId);
@@ -2961,11 +2962,14 @@ function buildMessages(sourceText, language, presetId, sourceSegments = getSourc
             isRenderedDomMode ? 'These segments come from an already-rendered SillyTavern chat display after Regex/display replacements. Translate only the visible natural-language text in source_text. Do not return HTML, CSS, JavaScript, Markdown fences, regex trigger syntax, or wrapper markup.' : '',
             forceTranslate ? `上一轮返回疑似照抄原文。请重新翻译，普通叙事和对话必须变成${targetLanguage}。` : '',
         ].filter(Boolean),
-        segments: sourceSegments.map(segment => ({
-            id: segment.id,
-            source_text: segment.source,
-        })),
+        segments: compact
+            ? sourceSegments.map(segment => [segment.id, segment.source])
+            : sourceSegments.map(segment => ({
+                id: segment.id,
+                source_text: segment.source,
+            })),
     };
+    const payloadText = compact ? JSON.stringify(payload) : JSON.stringify(payload, null, 2);
     return [
         {
             role: 'system',
@@ -2978,10 +2982,12 @@ function buildMessages(sourceText, language, presetId, sourceSegments = getSourc
             role: 'user',
             content: [
                 '下面是需要翻译的正文段落。请严格按 JSON 返回，禁止输出 JSON 以外的任何内容。',
-                '返回格式必须是：{"segments":[{"id":1,"translation":"..."}]}',
+                compact
+                    ? '输入 segments 使用紧凑格式：[id, source_text]。返回格式必须是：{"segments":[[id,"translation"],[id,"translation"]]}。'
+                    : '返回格式必须是：{"segments":[{"id":1,"translation":"..."}]}',
                 'translation 里可以包含换行，但不要新增、删除或合并段落 id；不要把 source_text 原样放进 translation。',
                 `目标语言再次确认：${targetLanguage}。`,
-                JSON.stringify(payload, null, 2),
+                payloadText,
             ].join('\n\n'),
         },
     ];
@@ -3029,7 +3035,9 @@ function normalizeReturnedSegments(parsed, sourceSegments) {
 
     const byId = new Map();
     for (const item of list) {
-        const id = Number(item?.id ?? item?.index ?? item?.paragraph_id);
+        const id = Array.isArray(item)
+            ? Number(item[0])
+            : Number(item?.id ?? item?.index ?? item?.paragraph_id);
         if (Number.isFinite(id)) {
             byId.set(id, item);
         }
@@ -3049,6 +3057,14 @@ function normalizeReturnedSegments(parsed, sourceSegments) {
 }
 
 function pickTranslationText(item, sourceText) {
+    if (Array.isArray(item)) {
+        const direct = item[1];
+        if (direct !== undefined && direct !== null && !isSameText(direct, sourceText)) {
+            return direct;
+        }
+        return direct ?? '';
+    }
+
     const direct = item?.translation
         ?? item?.translated_text
         ?? item?.translatedText
@@ -3774,10 +3790,10 @@ async function requestTranslationText(sourceText, options, onProgress) {
     const htmlPlan = createTranslationPlan(sourceText, options.messageId);
     const sourceSegments = htmlPlan?.segments || getSourceSegments(sourceText);
 
-    const buildBody = (forceTranslate = false, stream = false, segmentsForRequest = sourceSegments) => {
+    const buildBody = (forceTranslate = false, stream = false, segmentsForRequest = sourceSegments, compact = false) => {
         const body = {
             model: settings.model,
-            messages: buildMessages(sourceText, options.language, options.presetId, segmentsForRequest, forceTranslate),
+            messages: buildMessages(sourceText, options.language, options.presetId, segmentsForRequest, forceTranslate, compact),
             temperature: Number(settings.temperature) || 0,
             stream,
         };
@@ -3788,8 +3804,8 @@ async function requestTranslationText(sourceText, options, onProgress) {
         return body;
     };
 
-    const sendAndParse = async (forceTranslate = false, segmentsForRequest = sourceSegments, planForParse = htmlPlan) => {
-        const body = buildBody(forceTranslate, false, segmentsForRequest);
+    const sendAndParse = async (forceTranslate = false, segmentsForRequest = sourceSegments, planForParse = htmlPlan, compact = false) => {
+        const body = buildBody(forceTranslate, false, segmentsForRequest, compact);
         const response = settings.requestMode === requestModes.tavern
             ? await requestViaTavernBackend(endpoint, body)
             : await requestDirectly(endpoint, body);
@@ -3844,6 +3860,24 @@ async function requestTranslationText(sourceText, options, onProgress) {
         return parseTranslationResponse(rawText, sourceText, options.language, segmentsForRequest, planForParse);
     };
 
+    const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const isRateLimitError = error => /(?:\b429\b|too many requests|rate limit|限速|频率)/i.test(error?.message || String(error));
+    const sendBatchWithRateLimitRetry = async (batch, forceTranslate = false) => {
+        let lastError = null;
+        for (let attempt = 0; attempt <= aiRateLimitRetryDelays.length; attempt += 1) {
+            try {
+                return await sendAndParse(forceTranslate, batch, null, true);
+            } catch (error) {
+                lastError = error;
+                if (!isRateLimitError(error) || attempt >= aiRateLimitRetryDelays.length) {
+                    throw error;
+                }
+                await wait(aiRateLimitRetryDelays[attempt]);
+            }
+        }
+        throw lastError;
+    };
+
     const sendBatchedAndParse = async () => {
         const batches = makeAiSegmentBatches(sourceSegments);
         const resultSegments = sourceSegments.map(segment => ({
@@ -3893,9 +3927,9 @@ async function requestTranslationText(sourceText, options, onProgress) {
         };
 
         for (const batch of batches) {
-            let batchResult = await sendAndParse(false, batch, null);
+            let batchResult = await sendBatchWithRateLimitRetry(batch, false);
             if (batchResult.looksUntranslated || batchResult.missingTranslationCount) {
-                batchResult = await sendAndParse(true, batch, null);
+                batchResult = await sendBatchWithRateLimitRetry(batch, true);
                 batchResult.retriedForCopy = true;
             }
             if (batchResult.looksUntranslated) {
