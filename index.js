@@ -1366,6 +1366,27 @@ function collectRenderedDomTextNodes(root) {
     return nodes;
 }
 
+function collectHtmlCodeTranslationPlans(wrapper) {
+    if (!wrapper) return [];
+    const candidates = [];
+    wrapper.querySelectorAll('pre').forEach(element => candidates.push(element));
+    wrapper.querySelectorAll('code.language-html, code.lang-html, code[class*="language-html"], code[class*="lang-html"]').forEach(element => {
+        if (!element.closest('pre')) candidates.push(element);
+    });
+
+    const plans = [];
+    const seen = new Set();
+    for (const element of candidates) {
+        const code = decodeHtmlEntities(element.textContent || '').trim();
+        if (!code || seen.has(code)) continue;
+        seen.add(code);
+        if (!looksLikeFrontendHtmlCode(code) && !looksLikeHtmlDocumentSource(code)) continue;
+        const plan = createHtmlTranslationPlan(code);
+        if (plan?.segments?.length) plans.push(plan);
+    }
+    return plans;
+}
+
 function hasRenderedDomTranslationStructure(wrapper, sourceText = '') {
     if (!wrapper) return false;
     if (wrapper.querySelector('.TH-render iframe, iframe.stft-html-frame')) return false;
@@ -1418,7 +1439,16 @@ function getRenderedDomSourceWrapper(messageId, sourceText = '') {
     if (!$text.length) return null;
 
     const formattedWrapper = getFormattedMessageSourceWrapper(messageId, sourceText);
-    if (formattedWrapper && hasRenderedDomTranslationStructure(formattedWrapper, sourceText)) {
+    const formattedHtmlCodePlans = formattedWrapper
+        ? collectHtmlCodeTranslationPlans(formattedWrapper)
+        : [];
+    if (
+        formattedWrapper
+        && (
+            formattedHtmlCodePlans.length
+            || hasRenderedDomTranslationStructure(formattedWrapper, sourceText)
+        )
+    ) {
         return formattedWrapper;
     }
 
@@ -1440,12 +1470,14 @@ function createRenderedDomTranslationPlan(messageId, sourceText = '') {
     if (!wrapper) return null;
     const sourceHtml = wrapper.innerHTML;
     if (!sourceHtml) return null;
-    if (!hasRenderedDomTranslationStructure(wrapper, sourceText)) return null;
+    const htmlCodePlans = collectHtmlCodeTranslationPlans(wrapper);
+    if (!htmlCodePlans.length && !hasRenderedDomTranslationStructure(wrapper, sourceText)) return null;
 
     const textNodes = collectRenderedDomTextNodes(wrapper);
-    if (!textNodes.length) return null;
+    if (!textNodes.length && !htmlCodePlans.length) return null;
     const segments = [];
     const planNodes = [];
+    const renderedItems = [];
 
     for (const node of textNodes) {
         const raw = String(node.nodeValue ?? '');
@@ -1461,11 +1493,40 @@ function createRenderedDomTranslationPlan(messageId, sourceText = '') {
             leading,
             trailing,
         });
+        renderedItems.push({
+            source: core,
+            kind: 'rendered_dom_text_node',
+        });
         segments.push({
             id,
             source: core,
             kind: 'rendered_dom_text_node',
         });
+    }
+
+    if (htmlCodePlans.length) {
+        const segmentItems = [
+            ...renderedItems,
+            ...htmlCodePlans.flatMap(plan => plan.segments.map(segment => ({
+                source: segment.source,
+                kind: 'html_text_node',
+            }))),
+        ];
+        const mixedSegments = segmentItems.map((item, index) => ({
+            id: index + 1,
+            source: item.source,
+            kind: item.kind,
+        }));
+        return mixedSegments.length
+            ? {
+                mode: 'rendered_mixed',
+                source: String(sourceText ?? ''),
+                sourceHtml,
+                segments: mixedSegments,
+                renderedCount: renderedItems.length,
+                htmlCodeMixed: true,
+            }
+            : null;
     }
 
     return segments.length
