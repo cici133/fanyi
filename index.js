@@ -1397,12 +1397,12 @@ function getRenderedDomSourceWrapper(messageId) {
     if (!$text.length) return null;
 
     const wrapper = document.createElement('div');
-    const cached = getValidOriginalRenderCache(messageId);
-    if (cached?.nodes?.length) {
-        $(wrapper).append(cached.nodes.clone(true, true));
-    } else {
-        if ($text.find('.stft-render').length) return null;
+    if (!$text.find('.stft-render').length) {
         $(wrapper).append($text.contents().clone(true, true));
+    } else {
+        const cached = getValidOriginalRenderCache(messageId);
+        if (!cached?.nodes?.length) return null;
+        $(wrapper).append(cached.nodes.clone(true, true));
     }
 
     wrapper.querySelectorAll(`.${INLINE_TOGGLE_CLASS}, .${LEGACY_TOGGLE_CLASS}, .${LEGACY_PANEL_CLASS}, .stft-render`).forEach(element => {
@@ -1904,6 +1904,11 @@ function applyRenderedDomVersionDisplay(messageId, version, renderKey) {
     const $text = getMessageElement(messageId).find('.mes_text').first();
     if (!$text.length) return false;
     rememberOriginalRender(messageId, $text);
+    if (applyRenderedTextSegmentsToCurrentDom($text, getStoredRenderedDomSegments(version))) {
+        prependInlineToggleIfNeeded(messageId, $text, true, true);
+        $text.attr('data-stft-render-key', renderKey);
+        return true;
+    }
     const $nodes = buildRenderedDomVersionNodes(messageId, version);
     if (!$nodes?.length) return false;
     $text.empty();
@@ -2276,6 +2281,36 @@ function scheduleNativeMessageRendered(messageId) {
     emitNativeMessageRendered(messageId);
     setTimeout(() => emitNativeMessageRendered(messageId), 80);
     setTimeout(() => emitNativeMessageRendered(messageId), 260);
+}
+
+function waitForRenderFrame(delay = 80) {
+    return new Promise(resolve => {
+        const finish = () => setTimeout(resolve, delay);
+        if (typeof window.requestAnimationFrame === 'function') {
+            window.requestAnimationFrame(() => finish());
+        } else {
+            finish();
+        }
+    });
+}
+
+async function prepareMessageRenderForTranslation(messageId) {
+    const message = getMessageData(messageId);
+    const $text = getMessageElement(messageId).find('.mes_text').first();
+    if (!message || !$text.length) return;
+
+    try {
+        updateMessageBlock(Number(messageId), message);
+        clearOriginalRenderCache(messageId);
+        scheduleNativeMessageRendered(messageId);
+    } catch (error) {
+        console.warn('[Floor Translator] prepare render before translation failed', error);
+    }
+
+    await waitForRenderFrame(90);
+    renderFallbackFrontendCodeBlocks(messageId);
+    scheduleNativeMessageRendered(messageId);
+    await waitForRenderFrame(90);
 }
 
 function looksLikeFrontendHtmlCode(value) {
@@ -4038,7 +4073,7 @@ async function translateWithMicrosoft(text, targetLanguage) {
 
 async function requestMachineTranslationText(sourceText, options, onProgress) {
     const channel = options.channel || settings.translationChannel;
-    const htmlPlan = createTranslationPlan(sourceText, options.messageId);
+    const htmlPlan = options.translationPlan || createTranslationPlan(sourceText, options.messageId);
     const sourceSegments = htmlPlan?.segments || getSourceSegments(sourceText);
     const resultSegments = sourceSegments.map(segment => ({
         id: segment.id,
@@ -4123,7 +4158,7 @@ async function requestTranslationText(sourceText, options, onProgress) {
     const endpoint = normalizeEndpoint(settings.endpoint);
     if (!endpoint) throw new Error('请先在扩展设置里填写副 API / 反代地址。');
     if (!settings.model) throw new Error('请先填写翻译模型名。');
-    const htmlPlan = createTranslationPlan(sourceText, options.messageId);
+    const htmlPlan = options.translationPlan || createTranslationPlan(sourceText, options.messageId);
     const sourceSegments = htmlPlan?.segments || getSourceSegments(sourceText);
 
     const buildBody = (forceTranslate = false, stream = false, segmentsForRequest = sourceSegments, compact = false) => {
@@ -4357,6 +4392,7 @@ async function translateMessage(messageId, options = {}) {
     const channel = settings.translationChannel || translationChannels.ai;
     const channelName = getChannelName(channel);
     if (inFlight.has(recordKey)) return;
+    await prepareMessageRenderForTranslation(messageId);
 
     const localOptions = {
         messageId,
@@ -4370,6 +4406,7 @@ async function translateMessage(messageId, options = {}) {
         ? (settings.aiProgressMode || progressModes.final)
         : (settings.machineProgressMode || progressModes.stream);
     const htmlPlanForInitial = createTranslationPlan(sourceText, messageId);
+    localOptions.translationPlan = htmlPlanForInitial;
     const sourceSegmentsForTranslation = htmlPlanForInitial?.segments || getSourceSegments(sourceText);
     const initialPlanResult = htmlPlanForInitial
         ? makePlannedTranslationResult(
