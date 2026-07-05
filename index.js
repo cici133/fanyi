@@ -1392,19 +1392,7 @@ function hasRenderedDomTranslationStructure(wrapper, sourceText = '') {
     return Array.from(wrapper.querySelectorAll('*')).some(element => Object.keys(element.dataset || {}).length > 0);
 }
 
-function getRenderedDomSourceWrapper(messageId) {
-    const $text = getMessageElement(messageId).find('.mes_text').first();
-    if (!$text.length) return null;
-
-    const wrapper = document.createElement('div');
-    if (!$text.find('.stft-render').length) {
-        $(wrapper).append($text.contents().clone(true, true));
-    } else {
-        const cached = getValidOriginalRenderCache(messageId);
-        if (!cached?.nodes?.length) return null;
-        $(wrapper).append(cached.nodes.clone(true, true));
-    }
-
+function cleanRenderedSourceWrapper(wrapper) {
     wrapper.querySelectorAll(`.${INLINE_TOGGLE_CLASS}, .${LEGACY_TOGGLE_CLASS}, .${LEGACY_PANEL_CLASS}, .stft-render`).forEach(element => {
         if (element.classList.contains('stft-render')) {
             element.replaceWith(...Array.from(element.childNodes));
@@ -1415,9 +1403,40 @@ function getRenderedDomSourceWrapper(messageId) {
     return wrapper;
 }
 
+function getFormattedMessageSourceWrapper(messageId, sourceText = '') {
+    const source = String(sourceText ?? '').trim();
+    if (!source) return null;
+    const html = renderMarkdown(source, messageId);
+    if (!String(html ?? '').trim()) return null;
+    const wrapper = document.createElement('div');
+    wrapper.innerHTML = html;
+    return cleanRenderedSourceWrapper(wrapper);
+}
+
+function getRenderedDomSourceWrapper(messageId, sourceText = '') {
+    const $text = getMessageElement(messageId).find('.mes_text').first();
+    if (!$text.length) return null;
+
+    const formattedWrapper = getFormattedMessageSourceWrapper(messageId, sourceText);
+    if (formattedWrapper && hasRenderedDomTranslationStructure(formattedWrapper, sourceText)) {
+        return formattedWrapper;
+    }
+
+    const wrapper = document.createElement('div');
+    if (!$text.find('.stft-render').length) {
+        $(wrapper).append($text.contents().clone(true, true));
+    } else {
+        const cached = getValidOriginalRenderCache(messageId);
+        if (!cached?.nodes?.length) return null;
+        $(wrapper).append(cached.nodes.clone(true, true));
+    }
+
+    return cleanRenderedSourceWrapper(wrapper);
+}
+
 function createRenderedDomTranslationPlan(messageId, sourceText = '') {
     if (messageId === undefined || messageId === null || messageId === '') return null;
-    const wrapper = getRenderedDomSourceWrapper(messageId);
+    const wrapper = getRenderedDomSourceWrapper(messageId, sourceText);
     if (!wrapper) return null;
     const sourceHtml = wrapper.innerHTML;
     if (!sourceHtml) return null;
@@ -1511,8 +1530,8 @@ function createRenderedMixedTranslationPlan(messageId, sourceText = '') {
             element.remove();
         }
     });
-    wrapper.querySelectorAll('.TH-render iframe, iframe.stft-html-frame').forEach(iframeElement => {
-        const holder = iframeElement.closest('.TH-render') || iframeElement;
+    wrapper.querySelectorAll('.TH-render iframe, iframe.stft-html-frame, iframe.stft-fallback-iframe').forEach(iframeElement => {
+        const holder = iframeElement.closest('.TH-render, .stft-fallback-render') || iframeElement;
         holder.remove();
     });
 
@@ -1895,9 +1914,16 @@ function renderRenderedDomVersion(version, messageId = null) {
 
 function buildRenderedDomVersionNodes(messageId, version) {
     const wrapper = cloneCachedRenderedWrapper(messageId);
-    if (!wrapper) return null;
-    applyRenderedDomSegmentsToWrapper(wrapper, getStoredRenderedDomSegments(version));
-    return $(wrapper).contents();
+    if (wrapper) {
+        applyRenderedDomSegmentsToWrapper(wrapper, getStoredRenderedDomSegments(version));
+        return $(wrapper).contents();
+    }
+
+    const html = getStoredRenderedDomHtml(version);
+    if (!String(html ?? '').trim()) return null;
+    const fallback = document.createElement('div');
+    fallback.innerHTML = stripPluginChromeHtml(html);
+    return $(fallback).contents();
 }
 
 function applyRenderedDomVersionDisplay(messageId, version, renderKey) {
@@ -2477,7 +2503,7 @@ function normalizeHtmlTextForMatch(value) {
 }
 
 function findRenderedHtmlIframe($text) {
-    const frames = $text.find('.TH-render iframe').toArray();
+    const frames = $text.find('.TH-render iframe, iframe.stft-html-frame, iframe.stft-fallback-iframe').toArray();
     for (const iframe of frames) {
         try {
             if (iframe.contentDocument?.body) return iframe;
