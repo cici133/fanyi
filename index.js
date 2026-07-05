@@ -1513,10 +1513,10 @@ function makePlannedTranslationResult(plan, translatedSegments, targetLanguage, 
 }
 
 function createTranslationPlan(sourceText, messageId = null) {
-    const htmlPlan = createHtmlTranslationPlan(sourceText);
-    if (htmlPlan) return htmlPlan;
     const renderedPlan = createRenderedDomTranslationPlan(messageId, sourceText);
     if (renderedPlan) return renderedPlan;
+    const htmlPlan = createHtmlTranslationPlan(sourceText);
+    if (htmlPlan) return htmlPlan;
     assertHtmlTextExtraction(sourceText, null);
     return null;
 }
@@ -1676,8 +1676,81 @@ function getStoredRenderedDomHtml(version) {
     return '';
 }
 
-function renderRenderedDomVersion(version) {
+function getStoredRenderedDomSegments(version) {
+    if (Array.isArray(version?.renderedSegments) && version.renderedSegments.length) {
+        return version.renderedSegments;
+    }
+    const segment = version?.segments?.find(item => item.kind === 'rendered_dom' || item.renderedDom);
+    if (Array.isArray(segment?.renderedSegments) && segment.renderedSegments.length) {
+        return segment.renderedSegments;
+    }
+    return [];
+}
+
+function applyRenderedDomSegmentsToWrapper(wrapper, renderedSegments = []) {
+    if (!wrapper) return '';
+    const segments = Array.isArray(renderedSegments) ? renderedSegments : [];
+    if (!segments.length) return stripPluginChromeHtml(wrapper.innerHTML);
+
+    const nodes = collectRenderedDomTextNodes(wrapper);
+    let segmentIndex = 0;
+    for (const node of nodes) {
+        const segment = segments[segmentIndex];
+        if (!segment) break;
+        const raw = String(node.nodeValue ?? '');
+        const leading = raw.match(/^\s*/)?.[0] ?? '';
+        const trailing = raw.match(/\s*$/)?.[0] ?? '';
+        const text = String(segment.translation || segment.source || '').trim();
+        if (text) node.nodeValue = `${leading}${text}${trailing}`;
+        segmentIndex += 1;
+    }
+
+    return stripPluginChromeHtml(wrapper.innerHTML);
+}
+
+function cloneCachedRenderedWrapper(messageId) {
+    const cached = getValidOriginalRenderCache(messageId);
+    if (!cached?.nodes?.length) return null;
+    const wrapper = document.createElement('div');
+    $(wrapper).append(cached.nodes.clone(true, true));
+    wrapper.querySelectorAll(`.${INLINE_TOGGLE_CLASS}, .${LEGACY_TOGGLE_CLASS}, .${LEGACY_PANEL_CLASS}, .stft-render`).forEach(element => {
+        if (element.classList.contains('stft-render')) {
+            element.replaceWith(...Array.from(element.childNodes));
+        } else {
+            element.remove();
+        }
+    });
+    return wrapper;
+}
+
+function renderRenderedDomVersion(version, messageId = null) {
+    if (messageId !== null && messageId !== undefined) {
+        const wrapper = cloneCachedRenderedWrapper(messageId);
+        if (wrapper) {
+            return applyRenderedDomSegmentsToWrapper(wrapper, getStoredRenderedDomSegments(version));
+        }
+    }
     return stripPluginChromeHtml(getStoredRenderedDomHtml(version));
+}
+
+function buildRenderedDomVersionNodes(messageId, version) {
+    const wrapper = cloneCachedRenderedWrapper(messageId);
+    if (!wrapper) return null;
+    applyRenderedDomSegmentsToWrapper(wrapper, getStoredRenderedDomSegments(version));
+    return $(wrapper).contents();
+}
+
+function applyRenderedDomVersionDisplay(messageId, version, renderKey) {
+    const $text = getMessageElement(messageId).find('.mes_text').first();
+    if (!$text.length) return false;
+    rememberOriginalRender(messageId, $text);
+    const $nodes = buildRenderedDomVersionNodes(messageId, version);
+    if (!$nodes?.length) return false;
+    $text.empty();
+    $text.append($(renderInlineToggleButton(messageId, true)));
+    $text.append($nodes);
+    $text.attr('data-stft-render-key', renderKey);
+    return true;
 }
 
 function getHtmlVersionSegments(version) {
@@ -1952,7 +2025,7 @@ function renderHtmlDocumentVersion(messageId, version) {
 
 function renderCompareHtml(originalText, version, messageId) {
     if (isRenderedDomVersion(version)) {
-        return `<div class="stft-render stft-replace-render stft-rendered-dom-render">${renderInlineToggleButton(messageId, true)}${renderRenderedDomVersion(version)}</div>`;
+        return `<div class="stft-render stft-replace-render stft-rendered-dom-render">${renderInlineToggleButton(messageId, true)}${renderRenderedDomVersion(version, messageId)}</div>`;
     }
     if (isHtmlDocumentVersion(version)) {
         const html = isMixedHtmlDocumentVersion(version)
@@ -1994,7 +2067,7 @@ function buildHtmlNativeDisplayText(originalText, version, mode) {
 
 function renderReplaceHtml(originalText, version, messageId) {
     if (isRenderedDomVersion(version)) {
-        return `<div class="stft-render stft-replace-render stft-rendered-dom-render">${renderInlineToggleButton(messageId, true)}${renderRenderedDomVersion(version)}</div>`;
+        return `<div class="stft-render stft-replace-render stft-rendered-dom-render">${renderInlineToggleButton(messageId, true)}${renderRenderedDomVersion(version, messageId)}</div>`;
     }
     if (isHtmlDocumentVersion(version)) {
         const html = isMixedHtmlDocumentVersion(version)
@@ -2582,6 +2655,11 @@ function applyDisplay(messageId) {
             updateButtonState(getMessageElement(messageId));
             return;
         }
+    }
+
+    if (isRenderedDomVersion(version) && applyRenderedDomVersionDisplay(messageId, version, renderKey)) {
+        updateButtonState(getMessageElement(messageId));
+        return;
     }
 
     rememberOriginalRender(messageId, $text);
