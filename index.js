@@ -222,6 +222,8 @@ const liveTranslations = new Map();
 const mutedLiveDisplays = new Set();
 const originalRenderCache = new Map();
 const translatedIframeObservers = new WeakMap();
+const translatedIframeLoadHandlers = new WeakMap();
+const renderedHtmlRetryStates = new Map();
 
 function clone(value) {
     return JSON.parse(JSON.stringify(value));
@@ -1575,12 +1577,14 @@ function createRenderedMixedTranslationPlan(messageId, sourceText = '') {
     const $text = getMessageElement(messageId).find('.mes_text').first();
     if (!$text.length || $text.find('.stft-render').length) return null;
 
-    const iframe = findRenderedHtmlIframe($text);
-    if (!iframe) return null;
+    const iframes = findRenderedHtmlIframes($text);
+    if (!iframes.length) return null;
 
-    const iframeSourceHtml = getRenderedIframeSourceHtml(iframe);
-    const iframePlan = iframeSourceHtml ? createHtmlTranslationPlan(iframeSourceHtml) : null;
-    if (!iframePlan?.segments?.length) return null;
+    const iframePlans = iframes
+        .map(iframe => getRenderedIframeSourceHtml(iframe))
+        .map(sourceHtml => sourceHtml ? createHtmlTranslationPlan(sourceHtml) : null)
+        .filter(plan => plan?.segments?.length);
+    if (!iframePlans.length) return null;
 
     const wrapper = document.createElement('div');
     $(wrapper).append($text.contents().clone(true, true));
@@ -1612,10 +1616,10 @@ function createRenderedMixedTranslationPlan(messageId, sourceText = '') {
 
     const segmentItems = [
         ...renderedItems,
-        ...iframePlan.segments.map(segment => ({
+        ...iframePlans.flatMap(plan => plan.segments.map(segment => ({
             ...segment,
             kind: 'html_text_node',
-        })),
+        }))),
     ];
     if (!segmentItems.length) return null;
 
@@ -1630,7 +1634,7 @@ function createRenderedMixedTranslationPlan(messageId, sourceText = '') {
         source: String(sourceText ?? ''),
         segments,
         renderedCount: renderedItems.length,
-        iframePlan,
+        iframePlans,
     };
 }
 
@@ -2563,16 +2567,19 @@ function normalizeHtmlTextForMatch(value) {
         .trim();
 }
 
-function findRenderedHtmlIframe($text) {
+function findRenderedHtmlIframes($text) {
     const frames = $text.find('.TH-render iframe, iframe.stft-html-frame, iframe.stft-fallback-iframe').toArray();
-    for (const iframe of frames) {
+    return frames.filter(iframe => {
         try {
-            if (iframe.contentDocument?.body) return iframe;
+            return Boolean(iframe.contentDocument?.body);
         } catch {
-            // Ignore inaccessible frames and try the next rendered block.
+            return false;
         }
-    }
-    return null;
+    });
+}
+
+function findRenderedHtmlIframe($text) {
+    return findRenderedHtmlIframes($text)[0] || null;
 }
 
 function shouldTranslateRenderedIframeTextNode(node) {
@@ -2723,6 +2730,45 @@ function disconnectTranslatedIframeObserver(iframe) {
     translatedIframeObservers.delete(iframe);
 }
 
+function disconnectTranslatedIframeLoadHandler(iframe) {
+    const state = translatedIframeLoadHandlers.get(iframe);
+    if (!state) return;
+    try {
+        iframe.removeEventListener('load', state.handler);
+    } catch {
+        // Ignore stale iframe load handlers.
+    }
+    translatedIframeLoadHandlers.delete(iframe);
+}
+
+function installTranslatedIframeLoadHandler(iframe, htmlSegments, renderKey) {
+    const existing = translatedIframeLoadHandlers.get(iframe);
+    if (existing?.renderKey === renderKey) return;
+    disconnectTranslatedIframeLoadHandler(iframe);
+
+    const handler = () => {
+        if (iframe.dataset.stftTranslationKey !== renderKey) return;
+        let doc;
+        try {
+            doc = iframe.contentDocument;
+        } catch {
+            return;
+        }
+        if (!doc?.body) return;
+
+        disconnectTranslatedIframeObserver(iframe);
+        const changed = applyHtmlSegmentsToDocument(doc, htmlSegments, { repeat: true });
+        installTranslatedIframeObserver(iframe, htmlSegments, renderKey);
+        if (changed) {
+            stabilizeTranslatedIframeLayout(iframe);
+            scheduleTranslatedIframeResize(iframe);
+        }
+    };
+
+    iframe.addEventListener('load', handler);
+    translatedIframeLoadHandlers.set(iframe, { renderKey, handler });
+}
+
 function installTranslatedIframeObserver(iframe, htmlSegments, renderKey) {
     let doc;
     try {
@@ -2733,11 +2779,12 @@ function installTranslatedIframeObserver(iframe, htmlSegments, renderKey) {
     if (!doc?.body || typeof MutationObserver === 'undefined') return;
 
     const existing = translatedIframeObservers.get(iframe);
-    if (existing?.renderKey === renderKey) return;
+    if (existing?.renderKey === renderKey && existing?.document === doc) return;
     disconnectTranslatedIframeObserver(iframe);
 
     const state = {
         renderKey,
+        document: doc,
         timer: 0,
         observer: null,
     };
@@ -2779,12 +2826,17 @@ function applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey) {
     }
     if (!doc?.body) return false;
 
-    const changed = applyHtmlSegmentsToDocument(doc, htmlSegments, { repeat: false });
-    if (!changed) return false;
-    stabilizeTranslatedIframeLayout(iframe);
     iframe.dataset.stftTranslationKey = renderKey;
+    installTranslatedIframeLoadHandler(iframe, htmlSegments, renderKey);
     installTranslatedIframeObserver(iframe, htmlSegments, renderKey);
-    scheduleTranslatedIframeResize(iframe);
+    const changed = applyHtmlSegmentsToDocument(doc, htmlSegments, { repeat: false });
+    if (changed) {
+        stabilizeTranslatedIframeLayout(iframe);
+        scheduleTranslatedIframeResize(iframe);
+    }
+    // A just-created iframe may still contain an empty about:blank document.
+    // The load and mutation observers above will apply the same translations as
+    // soon as Tavern Helper mounts the actual regex-rendered interface.
     return true;
 }
 
@@ -2800,6 +2852,7 @@ function restoreHtmlSegmentsInRenderedIframe(iframe, htmlSegments) {
     }
     if (!doc?.body) return false;
     disconnectTranslatedIframeObserver(iframe);
+    disconnectTranslatedIframeLoadHandler(iframe);
 
     const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
         acceptNode(node) {
@@ -2831,42 +2884,84 @@ function restoreHtmlSegmentsInRenderedIframe(iframe, htmlSegments) {
 }
 
 function hasRenderedIframeTranslation($text, renderKey) {
-    return $text.find('.TH-render iframe').toArray().some(iframe => iframe.dataset?.stftTranslationKey === renderKey);
+    const frames = findRenderedHtmlIframes($text);
+    return Boolean(frames.length) && frames.every(iframe => iframe.dataset?.stftTranslationKey === renderKey);
 }
 
 function scheduleRenderedHtmlRetry(messageId, renderKey) {
+    const retryKey = `${getMessageRecordKey(messageId)}::${renderKey}`;
+    if (renderedHtmlRetryStates.has(retryKey)) return;
+
+    const delays = [40, 100, 220, 480, 900, 1600];
+    const state = { attempt: 0, timer: 0 };
+    renderedHtmlRetryStates.set(retryKey, state);
     scheduleNativeMessageRendered(messageId);
-    setTimeout(() => {
+    renderFallbackFrontendCodeBlocks(messageId);
+
+    const retry = () => {
         const { record } = getMessageRecord(messageId);
         const version = getSelectedVersion(record);
         const mode = record.displayMode || version?.displayMode || settings.displayMode;
         const currentRenderKey = getTextRenderKey(messageId, mode, version);
-        if (!record.visible || currentRenderKey !== renderKey) return;
+        if (!record.visible || currentRenderKey !== renderKey) {
+            renderedHtmlRetryStates.delete(retryKey);
+            return;
+        }
         const $text = getMessageElement(messageId).find('.mes_text').first();
-        if (!$text.length || hasRenderedIframeTranslation($text, renderKey)) return;
+        if (!$text.length) {
+            renderedHtmlRetryStates.delete(retryKey);
+            return;
+        }
+        renderFallbackFrontendCodeBlocks(messageId);
+        if (hasRenderedIframeTranslation($text, renderKey)) {
+            renderedHtmlRetryStates.delete(retryKey);
+            return;
+        }
         $text.removeAttr('data-stft-render-key');
         applyDisplay(messageId);
-    }, 260);
+        if (hasRenderedIframeTranslation($text, renderKey)) {
+            renderedHtmlRetryStates.delete(retryKey);
+            return;
+        }
+
+        state.attempt += 1;
+        if (state.attempt >= delays.length) {
+            renderedHtmlRetryStates.delete(retryKey);
+            return;
+        }
+        state.timer = window.setTimeout(retry, delays[state.attempt]);
+    };
+
+    state.timer = window.setTimeout(retry, delays[0]);
 }
 
 function applyRenderedHtmlDocumentDisplay(messageId, htmlSegments, renderKey) {
     const $text = getMessageElement(messageId).find('.mes_text').first();
     if (!$text.length) return false;
     if (hasRenderedIframeTranslation($text, renderKey)) {
-        const translatedIframe = findRenderedHtmlIframe($text);
-        if (translatedIframe) installTranslatedIframeObserver(translatedIframe, htmlSegments, renderKey);
+        findRenderedHtmlIframes($text).forEach(iframe => {
+            installTranslatedIframeLoadHandler(iframe, htmlSegments, renderKey);
+            installTranslatedIframeObserver(iframe, htmlSegments, renderKey);
+        });
         prependInlineToggleIfNeeded(messageId, $text, true, true);
         $text.attr('data-stft-render-key', renderKey);
         return true;
     }
 
-    const iframe = findRenderedHtmlIframe($text);
-    if (!iframe) {
+    const iframes = findRenderedHtmlIframes($text);
+    if (!iframes.length) {
         scheduleRenderedHtmlRetry(messageId, renderKey);
         return true;
     }
 
-    if (!applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey)) return false;
+    let armed = false;
+    for (const iframe of iframes) {
+        armed = applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey) || armed;
+    }
+    if (!armed) {
+        scheduleRenderedHtmlRetry(messageId, renderKey);
+        return true;
+    }
     prependInlineToggleIfNeeded(messageId, $text, true, true);
     $text.attr('data-stft-render-key', renderKey);
     return true;
@@ -2924,13 +3019,20 @@ function applyRenderedMixedVersionDisplay(messageId, version, renderKey) {
 
     if (htmlSegments.length) {
         if (hasRenderedIframeTranslation($text, renderKey)) {
-            const translatedIframe = findRenderedHtmlIframe($text);
-            if (translatedIframe) installTranslatedIframeObserver(translatedIframe, htmlSegments, renderKey);
+            findRenderedHtmlIframes($text).forEach(iframe => {
+                installTranslatedIframeLoadHandler(iframe, htmlSegments, renderKey);
+                installTranslatedIframeObserver(iframe, htmlSegments, renderKey);
+            });
             changed = true;
         } else {
-            const iframe = findRenderedHtmlIframe($text);
-            if (iframe) {
-                changed = applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey) || changed;
+            const iframes = findRenderedHtmlIframes($text);
+            if (iframes.length) {
+                let armed = false;
+                for (const iframe of iframes) {
+                    armed = applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey) || armed;
+                }
+                changed = armed || changed;
+                if (!armed) scheduleRenderedHtmlRetry(messageId, renderKey);
             } else {
                 scheduleRenderedHtmlRetry(messageId, renderKey);
                 changed = true;
@@ -2992,14 +3094,18 @@ function applyDisplay(messageId) {
     const mixedHtmlVersion = htmlVersion && isMixedHtmlDocumentVersion(version);
     if ($text.attr('data-stft-render-key') === renderKey) {
         if (renderedMixedVersion) {
+            const htmlSegments = getHtmlVersionSegments(version);
+            if (!htmlSegments.length || hasRenderedIframeTranslation($text, renderKey)) {
+                updateButtonState($mes);
+                return;
+            }
+            $text.removeAttr('data-stft-render-key');
+        }
+        if (!renderedMixedVersion && htmlVersion && !mixedHtmlVersion && !hasRenderedIframeTranslation($text, renderKey)) {
+            $text.removeAttr('data-stft-render-key');
+        } else if (!renderedMixedVersion) {
             updateButtonState($mes);
             return;
-        }
-        if (htmlVersion && !mixedHtmlVersion && !hasRenderedIframeTranslation($text, renderKey)) {
-            $text.removeAttr('data-stft-render-key');
-        } else {
-        updateButtonState($mes);
-        return;
         }
     }
 
