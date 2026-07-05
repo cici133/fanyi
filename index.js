@@ -1490,6 +1490,70 @@ function createRenderedIframeTranslationPlan(messageId) {
     return plan;
 }
 
+function createRenderedMixedTranslationPlan(messageId, sourceText = '') {
+    if (messageId === undefined || messageId === null || messageId === '') return null;
+    const $text = getMessageElement(messageId).find('.mes_text').first();
+    if (!$text.length || $text.find('.stft-render').length) return null;
+
+    const iframe = findRenderedHtmlIframe($text);
+    if (!iframe) return null;
+
+    const iframeSourceHtml = getRenderedIframeSourceHtml(iframe);
+    const iframePlan = iframeSourceHtml ? createHtmlTranslationPlan(iframeSourceHtml) : null;
+    if (!iframePlan?.segments?.length) return null;
+
+    const wrapper = document.createElement('div');
+    $(wrapper).append($text.contents().clone(true, true));
+    wrapper.querySelectorAll(`.${INLINE_TOGGLE_CLASS}, .${LEGACY_TOGGLE_CLASS}, .${LEGACY_PANEL_CLASS}, .stft-render`).forEach(element => {
+        if (element.classList.contains('stft-render')) {
+            element.replaceWith(...Array.from(element.childNodes));
+        } else {
+            element.remove();
+        }
+    });
+    wrapper.querySelectorAll('.TH-render iframe, iframe.stft-html-frame').forEach(iframeElement => {
+        const holder = iframeElement.closest('.TH-render') || iframeElement;
+        holder.remove();
+    });
+
+    const renderedNodes = collectRenderedDomTextNodes(wrapper);
+    const renderedItems = [];
+    for (const node of renderedNodes) {
+        const raw = String(node.nodeValue ?? '');
+        const leading = raw.match(/^\s*/)?.[0] ?? '';
+        const trailing = raw.match(/\s*$/)?.[0] ?? '';
+        const core = raw.slice(leading.length, raw.length - trailing.length);
+        if (!core.trim()) continue;
+        renderedItems.push({
+            source: core,
+            kind: 'rendered_dom_text_node',
+        });
+    }
+
+    const segmentItems = [
+        ...renderedItems,
+        ...iframePlan.segments.map(segment => ({
+            ...segment,
+            kind: 'html_text_node',
+        })),
+    ];
+    if (!segmentItems.length) return null;
+
+    const segments = segmentItems.map((item, index) => ({
+        id: index + 1,
+        source: item.source,
+        kind: item.kind,
+    }));
+
+    return {
+        mode: 'rendered_mixed',
+        source: String(sourceText ?? ''),
+        segments,
+        renderedCount: renderedItems.length,
+        iframePlan,
+    };
+}
+
 function applyRenderedDomTranslationPlan(plan, translatedSegments = []) {
     if (!plan?.wrapper) return '';
     const translations = new Map();
@@ -1534,7 +1598,59 @@ function makeRenderedDomTranslationResult(plan, translatedSegments, targetLangua
     };
 }
 
+function makeRenderedMixedTranslationResult(plan, translatedSegments, targetLanguage, raw = '', usedFallback = false) {
+    const renderedSegments = [];
+    const htmlSegments = [];
+
+    for (const segment of translatedSegments || []) {
+        const normalized = {
+            id: segment.id,
+            source: segment.source,
+            translation: String(segment.translation ?? '').trim(),
+            kind: segment.kind,
+        };
+        if (segment.kind === 'rendered_dom_text_node') {
+            renderedSegments.push(normalized);
+        } else if (segment.kind === 'html_text_node') {
+            htmlSegments.push(normalized);
+        }
+    }
+
+    const text = translatedSegments
+        .map(segment => String(segment.translation ?? '').trim())
+        .filter(Boolean)
+        .join('\n\n')
+        .trim();
+    const missingTranslationCount = translatedSegments.filter(segment => !String(segment.translation ?? '').trim()).length;
+
+    return {
+        text,
+        renderedMixed: true,
+        renderedDom: Boolean(renderedSegments.length),
+        renderedSegments,
+        htmlMode: Boolean(htmlSegments.length),
+        mixedHtml: true,
+        htmlSegments,
+        segments: [{
+            id: 1,
+            source: plan.source || '',
+            translation: text,
+            kind: 'rendered_mixed',
+            renderedMixed: true,
+            renderedSegments,
+            htmlSegments,
+        }],
+        raw: String(raw ?? '').trim(),
+        usedFallback,
+        looksUntranslated: isProbablyUntranslated(translatedSegments, targetLanguage),
+        missingTranslationCount,
+    };
+}
+
 function makePlannedTranslationResult(plan, translatedSegments, targetLanguage, raw = '', usedFallback = false) {
+    if (plan?.mode === 'rendered_mixed') {
+        return makeRenderedMixedTranslationResult(plan, translatedSegments, targetLanguage, raw, usedFallback);
+    }
     if (plan?.mode === 'rendered_dom') {
         return makeRenderedDomTranslationResult(plan, translatedSegments, targetLanguage, raw, usedFallback);
     }
@@ -1542,6 +1658,8 @@ function makePlannedTranslationResult(plan, translatedSegments, targetLanguage, 
 }
 
 function createTranslationPlan(sourceText, messageId = null) {
+    const renderedMixedPlan = createRenderedMixedTranslationPlan(messageId, sourceText);
+    if (renderedMixedPlan) return renderedMixedPlan;
     const renderedIframePlan = createRenderedIframeTranslationPlan(messageId);
     if (renderedIframePlan) return renderedIframePlan;
     const renderedPlan = createRenderedDomTranslationPlan(messageId, sourceText);
@@ -1699,6 +1817,13 @@ function isRenderedDomVersion(version) {
     );
 }
 
+function isRenderedMixedVersion(version) {
+    return Boolean(
+        version?.renderedMixed
+        || version?.segments?.some(segment => segment.kind === 'rendered_mixed' || segment.renderedMixed)
+    );
+}
+
 function getStoredRenderedDomHtml(version) {
     const text = String(version?.text ?? '').trim();
     if (text) return version.text;
@@ -1714,6 +1839,10 @@ function getStoredRenderedDomSegments(version) {
     const segment = version?.segments?.find(item => item.kind === 'rendered_dom' || item.renderedDom);
     if (Array.isArray(segment?.renderedSegments) && segment.renderedSegments.length) {
         return segment.renderedSegments;
+    }
+    const mixedSegment = version?.segments?.find(item => item.kind === 'rendered_mixed' || item.renderedMixed);
+    if (Array.isArray(mixedSegment?.renderedSegments) && mixedSegment.renderedSegments.length) {
+        return mixedSegment.renderedSegments;
     }
     return [];
 }
@@ -1791,6 +1920,10 @@ function getHtmlVersionSegments(version) {
     const documentSegment = version?.segments?.find(segment => segment.kind === 'html_document');
     if (Array.isArray(documentSegment?.htmlSegments) && documentSegment.htmlSegments.length) {
         return documentSegment.htmlSegments.filter(segment => !segment.kind || segment.kind === 'html_text_node');
+    }
+    const mixedSegment = version?.segments?.find(segment => segment.kind === 'rendered_mixed' || segment.renderedMixed);
+    if (Array.isArray(mixedSegment?.htmlSegments) && mixedSegment.htmlSegments.length) {
+        return mixedSegment.htmlSegments.filter(segment => !segment.kind || segment.kind === 'html_text_node');
     }
     return [];
 }
@@ -2617,6 +2750,78 @@ function applyRenderedHtmlDocumentDisplay(messageId, htmlSegments, renderKey) {
     return true;
 }
 
+function applyRenderedTextSegmentsToCurrentDom($text, renderedSegments = []) {
+    if (!$text?.length || !Array.isArray(renderedSegments) || !renderedSegments.length) return false;
+    const queues = new Map();
+    for (const segment of renderedSegments) {
+        const key = normalizeHtmlTextForMatch(segment.source);
+        const translation = String(segment.translation ?? segment.text ?? '').trim();
+        if (!key || !translation) continue;
+        if (!queues.has(key)) queues.set(key, []);
+        queues.get(key).push(translation);
+    }
+    if (!queues.size) return false;
+
+    const walker = document.createTreeWalker($text[0], NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+            return shouldUseRenderedDomTextNode(node)
+                ? NodeFilter.FILTER_ACCEPT
+                : NodeFilter.FILTER_REJECT;
+        },
+    });
+
+    let changed = false;
+    let node;
+    while ((node = walker.nextNode())) {
+        const raw = String(node.nodeValue ?? '');
+        const leading = raw.match(/^\s*/)?.[0] ?? '';
+        const trailing = raw.match(/\s*$/)?.[0] ?? '';
+        const core = raw.slice(leading.length, raw.length - trailing.length);
+        const key = normalizeHtmlTextForMatch(core);
+        const queue = queues.get(key);
+        const translation = queue?.shift();
+        if (!translation) continue;
+        node.nodeValue = `${leading}${translation}${trailing}`;
+        changed = true;
+    }
+    return changed;
+}
+
+function applyRenderedMixedVersionDisplay(messageId, version, renderKey) {
+    const $text = getMessageElement(messageId).find('.mes_text').first();
+    if (!$text.length) return false;
+    rememberOriginalRender(messageId, $text);
+
+    const renderedSegments = getStoredRenderedDomSegments(version);
+    const htmlSegments = getHtmlVersionSegments(version);
+    let changed = false;
+
+    if (renderedSegments.length) {
+        changed = applyRenderedTextSegmentsToCurrentDom($text, renderedSegments) || changed;
+    }
+
+    if (htmlSegments.length) {
+        if (hasRenderedIframeTranslation($text, renderKey)) {
+            const translatedIframe = findRenderedHtmlIframe($text);
+            if (translatedIframe) installTranslatedIframeObserver(translatedIframe, htmlSegments, renderKey);
+            changed = true;
+        } else {
+            const iframe = findRenderedHtmlIframe($text);
+            if (iframe) {
+                changed = applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey) || changed;
+            } else {
+                scheduleRenderedHtmlRetry(messageId, renderKey);
+                changed = true;
+            }
+        }
+    }
+
+    if (!changed) return false;
+    prependInlineToggleIfNeeded(messageId, $text, true, true);
+    $text.attr('data-stft-render-key', renderKey);
+    return true;
+}
+
 function restoreRenderedHtmlDocumentDisplay(messageId, record, renderKey) {
     const $text = getMessageElement(messageId).find('.mes_text').first();
     if (!$text.length) return false;
@@ -2661,14 +2866,24 @@ function applyDisplay(messageId) {
     const mode = record.displayMode || version.displayMode || settings.displayMode;
     const renderKey = getTextRenderKey(messageId, mode, version);
     const htmlVersion = isHtmlDocumentVersion(version);
+    const renderedMixedVersion = isRenderedMixedVersion(version);
     const mixedHtmlVersion = htmlVersion && isMixedHtmlDocumentVersion(version);
     if ($text.attr('data-stft-render-key') === renderKey) {
+        if (renderedMixedVersion) {
+            updateButtonState($mes);
+            return;
+        }
         if (htmlVersion && !mixedHtmlVersion && !hasRenderedIframeTranslation($text, renderKey)) {
             $text.removeAttr('data-stft-render-key');
         } else {
         updateButtonState($mes);
         return;
         }
+    }
+
+    if (renderedMixedVersion && applyRenderedMixedVersionDisplay(messageId, version, renderKey)) {
+        updateButtonState(getMessageElement(messageId));
+        return;
     }
 
     if (htmlVersion && !mixedHtmlVersion) {
@@ -2719,6 +2934,15 @@ function restoreDisplay(messageId, updateRecord = true) {
         const renderKey = getTextRenderKey(messageId, hasTranslation ? 'original-toggle' : 'original');
         const selectedVersion = getSelectedVersion(record);
         if (restoreRenderedHtmlDocumentDisplay(messageId, record, renderKey)) {
+            if (updateRecord) {
+                updateMessageRecord(messageId, nextRecord => {
+                    nextRecord.visible = false;
+                });
+            }
+            updateButtonState($mes);
+            return;
+        }
+        if (isRenderedMixedVersion(selectedVersion) && restoreNativeMessageDisplay(messageId, hasTranslation, renderKey)) {
             if (updateRecord) {
                 updateMessageRecord(messageId, nextRecord => {
                     nextRecord.visible = false;
@@ -2926,7 +3150,7 @@ function applyTranslationResultToVersion(version, result) {
     version.segments = Array.isArray(result.segments) ? result.segments : version.segments;
     version.usedFallback = Boolean(result.usedFallback);
 
-    for (const key of ['htmlSegments', 'htmlMode', 'mixedHtml', 'renderedDom', 'renderedSegments']) {
+    for (const key of ['htmlSegments', 'htmlMode', 'mixedHtml', 'renderedDom', 'renderedSegments', 'renderedMixed']) {
         if (result[key] !== undefined) {
             version[key] = result[key];
         } else {
