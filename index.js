@@ -1461,6 +1461,35 @@ function createRenderedDomTranslationPlan(messageId, sourceText = '') {
         : null;
 }
 
+function getRenderedIframeSourceHtml(iframe) {
+    let doc;
+    try {
+        doc = iframe?.contentDocument;
+    } catch {
+        return '';
+    }
+    if (!doc?.documentElement || !doc.body) return '';
+    const doctype = doc.doctype
+        ? `<!DOCTYPE ${doc.doctype.name}>`
+        : '<!DOCTYPE html>';
+    return `${doctype}\n${doc.documentElement.outerHTML}`;
+}
+
+function createRenderedIframeTranslationPlan(messageId) {
+    if (messageId === undefined || messageId === null || messageId === '') return null;
+    const $text = getMessageElement(messageId).find('.mes_text').first();
+    if (!$text.length || $text.find('.stft-render').length) return null;
+    const iframe = findRenderedHtmlIframe($text);
+    if (!iframe) return null;
+
+    const sourceHtml = getRenderedIframeSourceHtml(iframe);
+    if (!sourceHtml) return null;
+    const plan = createHtmlTranslationPlan(sourceHtml);
+    if (!plan?.segments?.length) return null;
+    plan.renderedIframe = true;
+    return plan;
+}
+
 function applyRenderedDomTranslationPlan(plan, translatedSegments = []) {
     if (!plan?.wrapper) return '';
     const translations = new Map();
@@ -1513,6 +1542,8 @@ function makePlannedTranslationResult(plan, translatedSegments, targetLanguage, 
 }
 
 function createTranslationPlan(sourceText, messageId = null) {
+    const renderedIframePlan = createRenderedIframeTranslationPlan(messageId);
+    if (renderedIframePlan) return renderedIframePlan;
     const renderedPlan = createRenderedDomTranslationPlan(messageId, sourceText);
     if (renderedPlan) return renderedPlan;
     const htmlPlan = createHtmlTranslationPlan(sourceText);
