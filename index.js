@@ -1389,12 +1389,431 @@ function looksLikeNaturalLanguageCodeText(value) {
     return letters >= 4;
 }
 
+function getCodeSourceLines(sourceText) {
+    const source = String(sourceText ?? '');
+    const lines = [];
+    let start = 0;
+    while (start < source.length) {
+        let contentEnd = start;
+        while (contentEnd < source.length && source[contentEnd] !== '\n' && source[contentEnd] !== '\r') {
+            contentEnd += 1;
+        }
+        let end = contentEnd;
+        if (source[end] === '\r' && source[end + 1] === '\n') end += 2;
+        else if (source[end] === '\r' || source[end] === '\n') end += 1;
+        lines.push({
+            start,
+            contentEnd,
+            end,
+            text: source.slice(start, contentEnd),
+        });
+        start = end;
+    }
+    return lines;
+}
+
+function isLikelyTranslatableCodeFragment(value) {
+    const text = String(value ?? '').trim();
+    if (!text || !/[\p{L}]/u.test(text)) return false;
+    if (/^(?:true|false|null|nil|none|yes|no|on|off|n\/?a|undefined|nan|inf(?:inity)?)$/i.test(text)) return false;
+    if (/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?$/i.test(text)) return false;
+    if (/^(?:https?|mailto|data|file):\S+$/i.test(text)) return false;
+    if (/^#[\da-f]{3,8}$/i.test(text)) return false;
+    if (/^<\/?[\w:-]+(?:\s[^>]*)?>$/.test(text)) return false;
+    if (/^[A-Z\d]{2,5}$/.test(text)) return false;
+    if (/^[A-Z\d]+(?:[_.:/-][A-Z\d]+)+$/.test(text)) return false;
+    if (/^[\w.-]+$/u.test(text) && /[_\\/]/.test(text)) return false;
+    return (text.match(/\p{L}/gu)?.length || 0) >= 2;
+}
+
+function decodeStructuredCodeLiteral(rawValue, encoding) {
+    const raw = String(rawValue ?? '');
+    if (encoding === 'json_double' || encoding === 'yaml_double') {
+        try {
+            return JSON.parse(`"${raw}"`);
+        } catch {
+            return raw
+                .replace(/\\n/g, '\n')
+                .replace(/\\r/g, '\r')
+                .replace(/\\t/g, '\t')
+                .replace(/\\"/g, '"')
+                .replace(/\\\\/g, '\\');
+        }
+    }
+    if (encoding === 'yaml_single' || encoding === 'json_single') {
+        return raw.replace(/''/g, "'").replace(/\\'/g, "'").replace(/\\\\/g, '\\');
+    }
+    return raw;
+}
+
+function encodeStructuredCodeTranslation(value, part) {
+    const text = String(value ?? '').trim();
+    if (part.encoding === 'json_double' || part.encoding === 'yaml_double') {
+        return JSON.stringify(text).slice(1, -1);
+    }
+    if (part.encoding === 'yaml_single') {
+        return text.replace(/\r?\n/g, ' ').replace(/'/g, "''");
+    }
+    if (part.encoding === 'json_single') {
+        return text.replace(/\r?\n/g, ' ').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    }
+    if (part.encoding === 'yaml_plain' && /(?:^[-?:,\[\]{}#&*!|>'"%@`]|:\s|\s#|\r|\n)/.test(text)) {
+        return JSON.stringify(text);
+    }
+    if (part.continuationIndent && /\r?\n/.test(text)) {
+        return text.replace(/\r?\n/g, `\n${part.continuationIndent}`);
+    }
+    return text;
+}
+
+function addStructuredCodePart(parts, sourceText, start, end, options = {}) {
+    const source = String(sourceText ?? '');
+    let partStart = Math.max(0, Number(start) || 0);
+    let partEnd = Math.min(source.length, Number(end) || 0);
+    if (partEnd <= partStart) return;
+
+    const raw = source.slice(partStart, partEnd);
+    const leading = raw.match(/^\s*/)?.[0] ?? '';
+    const trailing = raw.match(/\s*$/)?.[0] ?? '';
+    partStart += leading.length;
+    partEnd -= trailing.length;
+    if (partEnd <= partStart) return;
+
+    const encoding = options.encoding || 'raw';
+    const rawCore = source.slice(partStart, partEnd);
+    const decoded = decodeStructuredCodeLiteral(rawCore, encoding).trim();
+    if (!isLikelyTranslatableCodeFragment(decoded)) return;
+
+    const previous = parts[parts.length - 1];
+    if (previous && partStart < previous.end) return;
+    parts.push({
+        start: partStart,
+        end: partEnd,
+        source: decoded,
+        encoding,
+        continuationIndent: options.continuationIndent || '',
+    });
+}
+
+function collectProtectedCodeTextRanges(parts, sourceText, start, end, options = {}) {
+    const source = String(sourceText ?? '');
+    if (end <= start) return;
+    const markdown = Boolean(options.markdown);
+    const pattern = markdown
+        ? /<!--[\s\S]*?-->|<\/?[A-Za-z][^>\r\n]*>|\{\{[\s\S]*?\}\}|\$\{[\s\S]*?\}|<%[\s\S]*?%>|`+[^`\r\n]*`+|https?:\/\/[^\s"'<>]+|\]\([^\r\n)]*\)|!?\[|\*\*|__|~~|[*_~|]/g
+        : /<!--[\s\S]*?-->|<\/?[A-Za-z][^>\r\n]*>|\{\{[\s\S]*?\}\}|\$\{[\s\S]*?\}|<%[\s\S]*?%>|`+[^`\r\n]*`+|https?:\/\/[^\s"'<>]+/g;
+    const value = source.slice(start, end);
+    let cursor = 0;
+    let match;
+    while ((match = pattern.exec(value))) {
+        addStructuredCodePart(parts, source, start + cursor, start + match.index, options);
+        cursor = match.index + match[0].length;
+    }
+    addStructuredCodePart(parts, source, start + cursor, end, options);
+}
+
+function findStructuredQuoteEnd(text, start, quote) {
+    for (let index = start + 1; index < text.length; index += 1) {
+        if (quote === '"' && text[index] === '\\') {
+            index += 1;
+            continue;
+        }
+        if (quote === "'" && text[index] === "'" && text[index + 1] === "'") {
+            index += 1;
+            continue;
+        }
+        if (text[index] === quote) return index;
+    }
+    return -1;
+}
+
+function findYamlMappingColon(text) {
+    let single = false;
+    let double = false;
+    for (let index = 0; index < text.length; index += 1) {
+        const character = text[index];
+        if (double && character === '\\') {
+            index += 1;
+            continue;
+        }
+        if (!double && character === "'") {
+            if (single && text[index + 1] === "'") index += 1;
+            else single = !single;
+            continue;
+        }
+        if (!single && character === '"') {
+            double = !double;
+            continue;
+        }
+        if (!single && !double && character === ':' && (index + 1 === text.length || /\s/.test(text[index + 1]))) {
+            return index;
+        }
+    }
+    return -1;
+}
+
+function findYamlCommentIndex(text) {
+    let single = false;
+    let double = false;
+    for (let index = 0; index < text.length; index += 1) {
+        const character = text[index];
+        if (double && character === '\\') {
+            index += 1;
+            continue;
+        }
+        if (!double && character === "'") {
+            if (single && text[index + 1] === "'") index += 1;
+            else single = !single;
+            continue;
+        }
+        if (!single && character === '"') {
+            double = !double;
+            continue;
+        }
+        if (!single && !double && character === '#' && (index === 0 || /\s/.test(text[index - 1]))) {
+            return index;
+        }
+    }
+    return -1;
+}
+
+function collectQuotedStructuredValues(parts, sourceText, start, end, language) {
+    const source = String(sourceText ?? '');
+    let index = start;
+    while (index < end) {
+        const quote = source[index];
+        if (quote !== '"' && quote !== "'") {
+            index += 1;
+            continue;
+        }
+        const relativeEnd = findStructuredQuoteEnd(source.slice(0, end), index, quote);
+        if (relativeEnd < 0) break;
+        let next = relativeEnd + 1;
+        while (next < end && /\s/.test(source[next])) next += 1;
+        const isKey = source[next] === ':';
+        if (!isKey) {
+            const prefix = language.startsWith('json') ? 'json' : 'yaml';
+            addStructuredCodePart(parts, source, index + 1, relativeEnd, {
+                encoding: `${prefix}_${quote === '"' ? 'double' : 'single'}`,
+            });
+        }
+        index = relativeEnd + 1;
+    }
+}
+
+function collectYamlScalarParts(parts, sourceText, start, end, options = {}) {
+    const source = String(sourceText ?? '');
+    let valueStart = start;
+    let valueEnd = end;
+    while (valueStart < valueEnd && /\s/.test(source[valueStart])) valueStart += 1;
+    while (valueEnd > valueStart && /\s/.test(source[valueEnd - 1])) valueEnd -= 1;
+    if (valueEnd <= valueStart) return;
+
+    const first = source[valueStart];
+    if (first === '"' || first === "'") {
+        const quoteEnd = findStructuredQuoteEnd(source.slice(0, valueEnd), valueStart, first);
+        if (quoteEnd > valueStart) {
+            addStructuredCodePart(parts, source, valueStart + 1, quoteEnd, {
+                encoding: first === '"' ? 'yaml_double' : 'yaml_single',
+            });
+            return;
+        }
+    }
+
+    if (first === '[' || first === '{') {
+        collectQuotedStructuredValues(parts, source, valueStart, valueEnd, 'yaml');
+        return;
+    }
+
+    const prefix = source.slice(valueStart, valueEnd).match(/^(?:[&!][^\s]+\s+|\*[^\s]+\s*)/);
+    if (prefix) valueStart += prefix[0].length;
+    collectProtectedCodeTextRanges(parts, source, valueStart, valueEnd, {
+        encoding: options.encoding || 'yaml_plain',
+        continuationIndent: options.continuationIndent || '',
+    });
+}
+
+function collectYamlCodeParts(sourceText) {
+    const source = String(sourceText ?? '');
+    const parts = [];
+    let blockScalarIndent = null;
+
+    for (const line of getCodeSourceLines(source)) {
+        const lineText = line.text;
+        const indentLength = lineText.match(/^\s*/)?.[0].length || 0;
+        const trimmed = lineText.trim();
+
+        if (blockScalarIndent !== null) {
+            if (!trimmed) continue;
+            if (indentLength > blockScalarIndent) {
+                let contentStart = line.start + indentLength;
+                const contentEnd = line.contentEnd;
+                const marker = source.slice(contentStart, contentEnd).match(/^(?:[-*+]\s+|\d+[.)]\s+|#\s*)/);
+                if (marker) contentStart += marker[0].length;
+                collectProtectedCodeTextRanges(parts, source, contentStart, contentEnd, {
+                    continuationIndent: ' '.repeat(indentLength),
+                });
+                continue;
+            }
+            blockScalarIndent = null;
+        }
+
+        if (!trimmed || /^(?:---|\.\.\.|%YAML\b|%TAG\b)/i.test(trimmed)) continue;
+        if (trimmed.startsWith('#')) {
+            collectProtectedCodeTextRanges(parts, source, line.start + lineText.indexOf('#') + 1, line.contentEnd);
+            continue;
+        }
+
+        const commentIndex = findYamlCommentIndex(lineText);
+        const syntaxEnd = commentIndex >= 0 ? line.start + commentIndex : line.contentEnd;
+        const contentWithoutComment = lineText.slice(0, commentIndex >= 0 ? commentIndex : lineText.length);
+        const colonIndex = findYamlMappingColon(contentWithoutComment);
+
+        if (colonIndex >= 0) {
+            const valueStart = line.start + colonIndex + 1;
+            const valueText = source.slice(valueStart, syntaxEnd).trim();
+            if (/^[>|](?:[+-]?\d*|\d+[+-]?)?$/.test(valueText)) {
+                blockScalarIndent = indentLength;
+            } else {
+                collectYamlScalarParts(parts, source, valueStart, syntaxEnd);
+            }
+        } else {
+            const listMatch = contentWithoutComment.match(/^\s*[-*+]\s+/);
+            const plainStart = line.start + (listMatch?.[0].length || indentLength);
+            collectYamlScalarParts(parts, source, plainStart, syntaxEnd, {
+                continuationIndent: ' '.repeat(indentLength),
+            });
+        }
+
+        if (commentIndex >= 0) {
+            collectProtectedCodeTextRanges(parts, source, line.start + commentIndex + 1, line.contentEnd);
+        }
+    }
+
+    return parts;
+}
+
+function collectJsonCodeParts(sourceText, language = 'json') {
+    const source = String(sourceText ?? '');
+    const parts = [];
+    let index = 0;
+    while (index < source.length) {
+        if (source[index] === '/' && source[index + 1] === '/') {
+            const end = source.indexOf('\n', index + 2);
+            collectProtectedCodeTextRanges(parts, source, index + 2, end < 0 ? source.length : end);
+            index = end < 0 ? source.length : end;
+            continue;
+        }
+        if (source[index] === '/' && source[index + 1] === '*') {
+            const end = source.indexOf('*/', index + 2);
+            collectProtectedCodeTextRanges(parts, source, index + 2, end < 0 ? source.length : end);
+            index = end < 0 ? source.length : end + 2;
+            continue;
+        }
+
+        const quote = source[index];
+        if (quote !== '"' && !(language !== 'json' && quote === "'")) {
+            index += 1;
+            continue;
+        }
+        const quoteEnd = findStructuredQuoteEnd(source, index, quote);
+        if (quoteEnd < 0) break;
+        let next = quoteEnd + 1;
+        while (next < source.length && /\s/.test(source[next])) next += 1;
+        if (source[next] !== ':') {
+            addStructuredCodePart(parts, source, index + 1, quoteEnd, {
+                encoding: quote === '"' ? 'json_double' : 'json_single',
+            });
+        }
+        index = quoteEnd + 1;
+    }
+    return parts;
+}
+
+function collectMarkdownCodeParts(sourceText) {
+    const source = String(sourceText ?? '');
+    const parts = [];
+    for (const line of getCodeSourceLines(source)) {
+        const lineText = line.text;
+        const trimmed = lineText.trim();
+        if (!trimmed || /^(?:```|~~~)/.test(trimmed) || /^(?:[-*_]\s*){3,}$/.test(trimmed)) continue;
+
+        let contentStart = line.start + (lineText.match(/^\s*/)?.[0].length || 0);
+        const structuralPrefix = source.slice(contentStart, line.contentEnd).match(/^(?:(?:>\s*)+|#{1,6}\s+|[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)]\s+)/);
+        if (structuralPrefix) contentStart += structuralPrefix[0].length;
+        collectProtectedCodeTextRanges(parts, source, contentStart, line.contentEnd, { markdown: true });
+    }
+    return parts;
+}
+
+function collectPlainTextCodeParts(sourceText) {
+    const source = String(sourceText ?? '');
+    const parts = [];
+    for (const line of getCodeSourceLines(source)) {
+        collectProtectedCodeTextRanges(parts, source, line.start, line.contentEnd);
+    }
+    return parts;
+}
+
+function createStructuredTextCodePlan(sourceText, language = 'text') {
+    const source = String(sourceText ?? '');
+    const normalizedLanguage = String(language || 'text').toLowerCase();
+    let parts;
+    if (normalizedLanguage === 'yaml' || normalizedLanguage === 'yml') {
+        parts = collectYamlCodeParts(source);
+    } else if (normalizedLanguage === 'json' || normalizedLanguage === 'jsonc' || normalizedLanguage === 'json5') {
+        parts = collectJsonCodeParts(source, normalizedLanguage);
+    } else if (normalizedLanguage === 'markdown' || normalizedLanguage === 'md') {
+        parts = collectMarkdownCodeParts(source);
+    } else if (['text', 'txt', 'plaintext', 'plain', 'rst', 'asciidoc', 'adoc'].includes(normalizedLanguage)) {
+        parts = collectPlainTextCodeParts(source);
+    } else {
+        parts = [];
+        addStructuredCodePart(parts, source, 0, source.length);
+    }
+
+    parts.sort((left, right) => left.start - right.start || left.end - right.end);
+    const nonOverlapping = [];
+    for (const part of parts) {
+        const previous = nonOverlapping[nonOverlapping.length - 1];
+        if (previous && part.start < previous.end) continue;
+        nonOverlapping.push(part);
+    }
+    if (!nonOverlapping.length) return null;
+    return {
+        source,
+        language: normalizedLanguage,
+        parts: nonOverlapping,
+    };
+}
+
+function applyStructuredTextCodePlan(plan, translatedSegments = []) {
+    if (!plan?.source || !Array.isArray(plan.parts)) return '';
+    const translations = new Map();
+    for (const segment of translatedSegments || []) {
+        translations.set(Number(segment.id), String(segment.translation ?? segment.text ?? '').trim());
+    }
+
+    let output = '';
+    let cursor = 0;
+    for (const part of plan.parts) {
+        output += plan.source.slice(cursor, part.start);
+        const translated = translations.get(Number(part.segmentId));
+        output += translated
+            ? encodeStructuredCodeTranslation(translated, part)
+            : plan.source.slice(part.start, part.end);
+        cursor = part.end;
+    }
+    output += plan.source.slice(cursor);
+    return output;
+}
+
 function collectRenderedTextCodeItems(wrapper) {
     if (!wrapper) return [];
     const textLanguages = new Set([
         'yaml', 'yml', 'markdown', 'md', 'text', 'txt', 'plaintext', 'plain',
         'rst', 'asciidoc', 'adoc', 'toml', 'ini', 'properties', 'conf', 'config',
-        'log', 'csv', 'tsv',
+        'log', 'csv', 'tsv', 'json', 'jsonc', 'json5',
     ]);
     const items = [];
     const seenElements = new Set();
@@ -1415,6 +1834,8 @@ function collectRenderedTextCodeItems(wrapper) {
         const language = getRenderedCodeLanguage(element);
         if (language && !textLanguages.has(language)) return;
         if (!language && !looksLikeNaturalLanguageCodeText(core)) return;
+        const translationPlan = createStructuredTextCodePlan(core, language || 'text');
+        if (!translationPlan?.parts?.length) return;
 
         items.push({
             element,
@@ -1423,6 +1844,7 @@ function collectRenderedTextCodeItems(wrapper) {
             trailing,
             language: language || 'text',
             kind: 'rendered_code_text',
+            translationPlan,
         });
     });
 
@@ -1569,22 +1991,33 @@ function createRenderedDomTranslationPlan(messageId, sourceText = '') {
     }
 
     if (htmlCodePlans.length || textCodeItems.length) {
+        const codeTextPlans = textCodeItems.map(item => ({
+            source: item.source,
+            language: item.language,
+            parts: item.translationPlan.parts.map(part => ({ ...part })),
+        }));
+        const codeSegmentItems = codeTextPlans.flatMap(codePlan => codePlan.parts.map(part => ({
+            source: part.source,
+            kind: 'rendered_code_text',
+            codePart: part,
+        })));
         const segmentItems = [
             ...renderedItems,
-            ...textCodeItems.map(item => ({
-                source: item.source,
-                kind: 'rendered_code_text',
-            })),
+            ...codeSegmentItems,
             ...htmlCodePlans.flatMap(plan => plan.segments.map(segment => ({
                 source: segment.source,
                 kind: 'html_text_node',
             }))),
         ];
-        const mixedSegments = segmentItems.map((item, index) => ({
-            id: index + 1,
-            source: item.source,
-            kind: item.kind,
-        }));
+        const mixedSegments = segmentItems.map((item, index) => {
+            const id = index + 1;
+            if (item.codePart) item.codePart.segmentId = id;
+            return {
+                id,
+                source: item.source,
+                kind: item.kind,
+            };
+        });
         return mixedSegments.length
             ? {
                 mode: 'rendered_mixed',
@@ -1594,6 +2027,7 @@ function createRenderedDomTranslationPlan(messageId, sourceText = '') {
                 renderedCount: renderedItems.length,
                 htmlCodeMixed: true,
                 renderedCodeMixed: Boolean(textCodeItems.length),
+                codeTextPlans,
             }
             : null;
     }
@@ -1681,13 +2115,20 @@ function createRenderedMixedTranslationPlan(messageId, sourceText = '') {
         });
     }
     const textCodeItems = collectRenderedTextCodeItems(wrapper);
+    const codeTextPlans = textCodeItems.map(item => ({
+        source: item.source,
+        language: item.language,
+        parts: item.translationPlan.parts.map(part => ({ ...part })),
+    }));
+    const codeSegmentItems = codeTextPlans.flatMap(codePlan => codePlan.parts.map(part => ({
+        source: part.source,
+        kind: 'rendered_code_text',
+        codePart: part,
+    })));
 
     const segmentItems = [
         ...renderedItems,
-        ...textCodeItems.map(item => ({
-            source: item.source,
-            kind: 'rendered_code_text',
-        })),
+        ...codeSegmentItems,
         ...iframePlans.flatMap(plan => plan.segments.map(segment => ({
             ...segment,
             kind: 'html_text_node',
@@ -1695,11 +2136,15 @@ function createRenderedMixedTranslationPlan(messageId, sourceText = '') {
     ];
     if (!segmentItems.length) return null;
 
-    const segments = segmentItems.map((item, index) => ({
-        id: index + 1,
-        source: item.source,
-        kind: item.kind,
-    }));
+    const segments = segmentItems.map((item, index) => {
+        const id = index + 1;
+        if (item.codePart) item.codePart.segmentId = id;
+        return {
+            id,
+            source: item.source,
+            kind: item.kind,
+        };
+    });
 
     return {
         mode: 'rendered_mixed',
@@ -1707,6 +2152,7 @@ function createRenderedMixedTranslationPlan(messageId, sourceText = '') {
         segments,
         renderedCount: renderedItems.length,
         renderedCodeCount: textCodeItems.length,
+        codeTextPlans,
         iframePlans,
     };
 }
@@ -1759,6 +2205,7 @@ function makeRenderedMixedTranslationResult(plan, translatedSegments, targetLang
     const renderedSegments = [];
     const codeSegments = [];
     const htmlSegments = [];
+    const hasStructuredCodePlans = Array.isArray(plan?.codeTextPlans) && plan.codeTextPlans.length > 0;
 
     for (const segment of translatedSegments || []) {
         const normalized = {
@@ -1770,13 +2217,33 @@ function makeRenderedMixedTranslationResult(plan, translatedSegments, targetLang
         if (segment.kind === 'rendered_dom_text_node') {
             renderedSegments.push(normalized);
         } else if (segment.kind === 'rendered_code_text') {
-            codeSegments.push(normalized);
+            if (!hasStructuredCodePlans) codeSegments.push(normalized);
         } else if (segment.kind === 'html_text_node') {
             htmlSegments.push(normalized);
         }
     }
 
-    const text = translatedSegments
+    if (hasStructuredCodePlans) {
+        const translatedIds = new Set((translatedSegments || [])
+            .filter(segment => String(segment.translation ?? '').trim())
+            .map(segment => Number(segment.id)));
+        for (const [index, codePlan] of plan.codeTextPlans.entries()) {
+            const hasCodeTranslation = codePlan.parts.some(part => translatedIds.has(Number(part.segmentId)));
+            codeSegments.push({
+                id: codePlan.parts[0]?.segmentId || index + 1,
+                source: codePlan.source,
+                translation: hasCodeTranslation ? applyStructuredTextCodePlan(codePlan, translatedSegments) : '',
+                kind: 'rendered_code_text',
+                language: codePlan.language,
+            });
+        }
+    }
+
+    const text = [
+        ...renderedSegments,
+        ...codeSegments,
+        ...htmlSegments,
+    ]
         .map(segment => String(segment.translation ?? '').trim())
         .filter(Boolean)
         .join('\n\n')
@@ -3098,19 +3565,22 @@ function applyRenderedCodeSegmentsToCurrentDom($text, codeSegments = [], renderK
     const queues = new Map();
     for (const segment of codeSegments) {
         const key = normalizeHtmlTextForMatch(segment.source);
+        const sourceKey = hashText(key);
         const translation = String(segment.translation ?? segment.text ?? '').trim();
         if (!key || !translation) continue;
-        if (!queues.has(key)) queues.set(key, []);
-        queues.get(key).push(translation);
+        if (!queues.has(sourceKey)) queues.set(sourceKey, []);
+        queues.get(sourceKey).push(translation);
     }
     if (!queues.size) return false;
 
     let changed = false;
     for (const item of collectRenderedTextCodeItems($text[0])) {
-        const key = normalizeHtmlTextForMatch(item.source);
-        const translation = queues.get(key)?.shift();
+        const currentSourceKey = hashText(normalizeHtmlTextForMatch(item.source));
+        const sourceKey = item.element.dataset.stftCodeSourceKey || currentSourceKey;
+        const translation = queues.get(sourceKey)?.shift();
         if (!translation) continue;
         item.element.textContent = `${item.leading}${translation}${item.trailing}`;
+        item.element.dataset.stftCodeSourceKey = sourceKey;
         if (renderKey) item.element.dataset.stftCodeTranslationKey = renderKey;
         changed = true;
     }
@@ -3711,7 +4181,7 @@ function buildMessages(sourceText, language, presetId, sourceSegments = getSourc
             `只有某段本来就已经是${targetLanguage}，或者它只是专名、代码、标记、章节编号等不应翻译内容时，才可以原样复制。`,
             isHtmlNodeMode ? '这些 segments 来自 HTML 美化界面的可见文本节点，或来自脚本里运行时会显示到界面的自然语言文案。只翻译 source_text 的自然语言文字，不要返回 HTML 标签、属性、CSS、JavaScript 或 Markdown 代码块。' : '',
             isRenderedDomMode ? 'These segments come from an already-rendered SillyTavern chat display after Regex/display replacements. Translate only the visible natural-language text in source_text. Do not return HTML, CSS, JavaScript, Markdown fences, regex trigger syntax, or wrapper markup.' : '',
-            isRenderedCodeMode ? '这些 segments 是 YAML、Markdown 或纯文本代码块内部的展示文字。保留原有换行、缩进、列表符号、YAML 冒号和 Markdown 标记，只翻译其中的自然语言，不要添加或返回外层反引号围栏。' : '',
+            isRenderedCodeMode ? '这些 segments 是从 YAML、JSON、Markdown 或纯文本代码块中单独提取出的自然语言值。代码键名、缩进、引号、标签和标记已由前端保管；只返回 source_text 的译文，不要自行补充 YAML/JSON/Markdown 结构或外层反引号围栏。' : '',
             forceTranslate ? `上一轮返回疑似照抄原文。请重新翻译，普通叙事和对话必须变成${targetLanguage}。` : '',
         ].filter(Boolean),
         segments: compact
