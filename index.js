@@ -1381,6 +1381,23 @@ function getRenderedCodeLanguage(element) {
     ).trim().toLowerCase();
 }
 
+const structuredTextCodeLanguages = new Set([
+    'yaml', 'yml', 'markdown', 'md', 'text', 'txt', 'plaintext', 'plain',
+    'rst', 'asciidoc', 'adoc', 'toml', 'ini', 'properties', 'conf', 'config',
+    'log', 'csv', 'tsv', 'json', 'jsonc', 'json5',
+]);
+
+function isStructuredTextCodeLanguage(language) {
+    return structuredTextCodeLanguages.has(String(language || '').trim().toLowerCase());
+}
+
+function normalizeFenceLanguage(infoText) {
+    const info = String(infoText ?? '').trim();
+    if (!info) return '';
+    const match = info.match(/^(?:\{\s*)?\.?([A-Za-z0-9_+-]+)/);
+    return String(match?.[1] || '').toLowerCase().replace(/^(?:language|lang)-/, '');
+}
+
 function looksLikeNaturalLanguageCodeText(value) {
     const text = String(value ?? '').trim();
     if (!text || !/[\p{L}\p{N}]/u.test(text)) return false;
@@ -1787,6 +1804,79 @@ function createStructuredTextCodePlan(sourceText, language = 'text') {
     };
 }
 
+function collectSourceTextCodePlans(sourceText) {
+    const source = String(sourceText ?? '');
+    if (!source) return [];
+
+    const lines = getCodeSourceLines(source);
+    const plans = [];
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+        const openingLine = lines[lineIndex];
+        const opening = openingLine.text.match(/^ {0,3}(`{3,}|~{3,})([^\r\n]*)$/);
+        if (!opening) continue;
+
+        const marker = opening[1];
+        const markerCharacter = marker[0];
+        const closingPattern = new RegExp(`^ {0,3}${markerCharacter === '`' ? '`' : '~'}{${marker.length},}\\s*$`);
+        let closingLineIndex = lineIndex + 1;
+        while (closingLineIndex < lines.length && !closingPattern.test(lines[closingLineIndex].text)) {
+            closingLineIndex += 1;
+        }
+        if (closingLineIndex >= lines.length) continue;
+
+        const bodyRaw = source.slice(openingLine.end, lines[closingLineIndex].start);
+        const leading = bodyRaw.match(/^\s*/)?.[0] ?? '';
+        const trailing = bodyRaw.match(/\s*$/)?.[0] ?? '';
+        const body = bodyRaw.slice(leading.length, bodyRaw.length - trailing.length);
+        const declaredLanguage = normalizeFenceLanguage(opening[2]);
+        const language = declaredLanguage || 'text';
+        const isTextFence = declaredLanguage
+            ? isStructuredTextCodeLanguage(declaredLanguage)
+            : looksLikeNaturalLanguageCodeText(body);
+
+        if (body && isTextFence && !looksLikeHtmlDocumentSource(body)) {
+            const plan = createStructuredTextCodePlan(body, language);
+            if (plan?.parts?.length) {
+                plans.push({
+                    source: plan.source,
+                    language: plan.language,
+                    parts: plan.parts.map(part => ({ ...part })),
+                    sourceFenceIndex: plans.length,
+                });
+            }
+        }
+
+        lineIndex = closingLineIndex;
+    }
+    return plans;
+}
+
+function mergeStructuredTextCodePlans(textCodeItems, sourceText = '') {
+    const sourcePlans = collectSourceTextCodePlans(sourceText);
+    const domPlans = (textCodeItems || []).map(item => ({
+        source: item.source,
+        language: item.language,
+        parts: item.translationPlan.parts.map(part => ({ ...part })),
+    }));
+    if (!sourcePlans.length) return domPlans;
+
+    const occurrenceCounts = new Map();
+    for (const plan of sourcePlans) {
+        const key = `${plan.language}\u0000${normalizeHtmlTextForMatch(plan.source)}`;
+        occurrenceCounts.set(key, (occurrenceCounts.get(key) || 0) + 1);
+    }
+
+    const seenDomCounts = new Map();
+    const extraDomPlans = [];
+    for (const plan of domPlans) {
+        const key = `${plan.language}\u0000${normalizeHtmlTextForMatch(plan.source)}`;
+        const seen = (seenDomCounts.get(key) || 0) + 1;
+        seenDomCounts.set(key, seen);
+        if (seen > (occurrenceCounts.get(key) || 0)) extraDomPlans.push(plan);
+    }
+    return [...sourcePlans, ...extraDomPlans];
+}
+
 function applyStructuredTextCodePlan(plan, translatedSegments = []) {
     if (!plan?.source || !Array.isArray(plan.parts)) return '';
     const translations = new Map();
@@ -1808,13 +1898,8 @@ function applyStructuredTextCodePlan(plan, translatedSegments = []) {
     return output;
 }
 
-function collectRenderedTextCodeItems(wrapper) {
+function collectRenderedCodeElementItems(wrapper) {
     if (!wrapper) return [];
-    const textLanguages = new Set([
-        'yaml', 'yml', 'markdown', 'md', 'text', 'txt', 'plaintext', 'plain',
-        'rst', 'asciidoc', 'adoc', 'toml', 'ini', 'properties', 'conf', 'config',
-        'log', 'csv', 'tsv', 'json', 'jsonc', 'json5',
-    ]);
     const items = [];
     const seenElements = new Set();
 
@@ -1829,13 +1914,29 @@ function collectRenderedTextCodeItems(wrapper) {
         const trailing = raw.match(/\s*$/)?.[0] ?? '';
         const core = raw.slice(leading.length, raw.length - trailing.length);
         if (!core.trim()) return;
-        if (looksLikeFrontendHtmlCode(core) || looksLikeHtmlDocumentSource(core)) return;
 
-        const language = getRenderedCodeLanguage(element);
-        if (language && !textLanguages.has(language)) return;
-        if (!language && !looksLikeNaturalLanguageCodeText(core)) return;
+        items.push({
+            element,
+            source: core,
+            leading,
+            trailing,
+            language: getRenderedCodeLanguage(element),
+        });
+    });
+
+    return items;
+}
+
+function collectRenderedTextCodeItems(wrapper) {
+    const items = [];
+    for (const candidate of collectRenderedCodeElementItems(wrapper)) {
+        const { element, source: core, leading, trailing } = candidate;
+        const language = candidate.language;
+        if (language && !isStructuredTextCodeLanguage(language)) continue;
+        if (!language && (looksLikeFrontendHtmlCode(core) || looksLikeHtmlDocumentSource(core))) continue;
+        if (!language && !looksLikeNaturalLanguageCodeText(core)) continue;
         const translationPlan = createStructuredTextCodePlan(core, language || 'text');
-        if (!translationPlan?.parts?.length) return;
+        if (!translationPlan?.parts?.length) continue;
 
         items.push({
             element,
@@ -1846,7 +1947,7 @@ function collectRenderedTextCodeItems(wrapper) {
             kind: 'rendered_code_text',
             translationPlan,
         });
-    });
+    }
 
     return items;
 }
@@ -1957,10 +2058,11 @@ function createRenderedDomTranslationPlan(messageId, sourceText = '') {
     if (!sourceHtml) return null;
     const htmlCodePlans = collectHtmlCodeTranslationPlans(wrapper);
     const textCodeItems = collectRenderedTextCodeItems(wrapper);
-    if (!htmlCodePlans.length && !textCodeItems.length && !hasRenderedDomTranslationStructure(wrapper, sourceText)) return null;
+    const codeTextPlans = mergeStructuredTextCodePlans(textCodeItems, sourceText);
+    if (!htmlCodePlans.length && !codeTextPlans.length && !hasRenderedDomTranslationStructure(wrapper, sourceText)) return null;
 
     const textNodes = collectRenderedDomTextNodes(wrapper);
-    if (!textNodes.length && !htmlCodePlans.length && !textCodeItems.length) return null;
+    if (!textNodes.length && !htmlCodePlans.length && !codeTextPlans.length) return null;
     const segments = [];
     const planNodes = [];
     const renderedItems = [];
@@ -1990,12 +2092,7 @@ function createRenderedDomTranslationPlan(messageId, sourceText = '') {
         });
     }
 
-    if (htmlCodePlans.length || textCodeItems.length) {
-        const codeTextPlans = textCodeItems.map(item => ({
-            source: item.source,
-            language: item.language,
-            parts: item.translationPlan.parts.map(part => ({ ...part })),
-        }));
+    if (htmlCodePlans.length || codeTextPlans.length) {
         const codeSegmentItems = codeTextPlans.flatMap(codePlan => codePlan.parts.map(part => ({
             source: part.source,
             kind: 'rendered_code_text',
@@ -2026,7 +2123,7 @@ function createRenderedDomTranslationPlan(messageId, sourceText = '') {
                 segments: mixedSegments,
                 renderedCount: renderedItems.length,
                 htmlCodeMixed: true,
-                renderedCodeMixed: Boolean(textCodeItems.length),
+                renderedCodeMixed: Boolean(codeTextPlans.length),
                 codeTextPlans,
             }
             : null;
@@ -2115,11 +2212,7 @@ function createRenderedMixedTranslationPlan(messageId, sourceText = '') {
         });
     }
     const textCodeItems = collectRenderedTextCodeItems(wrapper);
-    const codeTextPlans = textCodeItems.map(item => ({
-        source: item.source,
-        language: item.language,
-        parts: item.translationPlan.parts.map(part => ({ ...part })),
-    }));
+    const codeTextPlans = mergeStructuredTextCodePlans(textCodeItems, sourceText);
     const codeSegmentItems = codeTextPlans.flatMap(codePlan => codePlan.parts.map(part => ({
         source: part.source,
         kind: 'rendered_code_text',
@@ -2151,7 +2244,7 @@ function createRenderedMixedTranslationPlan(messageId, sourceText = '') {
         source: String(sourceText ?? ''),
         segments,
         renderedCount: renderedItems.length,
-        renderedCodeCount: textCodeItems.length,
+        renderedCodeCount: codeTextPlans.length,
         codeTextPlans,
         iframePlans,
     };
@@ -2235,6 +2328,7 @@ function makeRenderedMixedTranslationResult(plan, translatedSegments, targetLang
                 translation: hasCodeTranslation ? applyStructuredTextCodePlan(codePlan, translatedSegments) : '',
                 kind: 'rendered_code_text',
                 language: codePlan.language,
+                sourceOrder: index,
             });
         }
     }
@@ -3562,25 +3656,45 @@ function applyRenderedTextSegmentsToCurrentDom($text, renderedSegments = []) {
 
 function applyRenderedCodeSegmentsToCurrentDom($text, codeSegments = [], renderKey = '') {
     if (!$text?.length || !Array.isArray(codeSegments) || !codeSegments.length) return false;
-    const queues = new Map();
-    for (const segment of codeSegments) {
+    const pending = [];
+    for (const [index, segment] of codeSegments.entries()) {
         const key = normalizeHtmlTextForMatch(segment.source);
         const sourceKey = hashText(key);
         const translation = String(segment.translation ?? segment.text ?? '').trim();
         if (!key || !translation) continue;
-        if (!queues.has(sourceKey)) queues.set(sourceKey, []);
-        queues.get(sourceKey).push(translation);
+        pending.push({
+            sourceKey,
+            translation,
+            language: String(segment.language || '').toLowerCase(),
+            sourceOrder: Number.isFinite(Number(segment.sourceOrder)) ? Number(segment.sourceOrder) : index,
+            used: false,
+        });
     }
-    if (!queues.size) return false;
+    if (!pending.length) return false;
 
     let changed = false;
-    for (const item of collectRenderedTextCodeItems($text[0])) {
+    const renderedItems = collectRenderedCodeElementItems($text[0]).filter(item => (
+        item.language
+            ? isStructuredTextCodeLanguage(item.language)
+            : (!looksLikeFrontendHtmlCode(item.source)
+                && !looksLikeHtmlDocumentSource(item.source)
+                && looksLikeNaturalLanguageCodeText(item.source))
+    ));
+    for (const [itemIndex, item] of renderedItems.entries()) {
         const currentSourceKey = hashText(normalizeHtmlTextForMatch(item.source));
         const sourceKey = item.element.dataset.stftCodeSourceKey || currentSourceKey;
-        const translation = queues.get(sourceKey)?.shift();
-        if (!translation) continue;
-        item.element.textContent = `${item.leading}${translation}${item.trailing}`;
-        item.element.dataset.stftCodeSourceKey = sourceKey;
+        let match = pending.find(candidate => !candidate.used && candidate.sourceKey === sourceKey);
+        if (!match) {
+            match = pending.find(candidate => (
+                !candidate.used
+                && candidate.sourceOrder === itemIndex
+                && (!candidate.language || !item.language || candidate.language === String(item.language).toLowerCase())
+            ));
+        }
+        if (!match) continue;
+        match.used = true;
+        item.element.textContent = `${item.leading}${match.translation}${item.trailing}`;
+        item.element.dataset.stftCodeSourceKey = match.sourceKey;
         if (renderKey) item.element.dataset.stftCodeTranslationKey = renderKey;
         changed = true;
     }
@@ -3597,7 +3711,7 @@ function hasRenderedCodeTranslation($text, codeSegments = [], renderKey = '') {
     }
     if (!expected.size) return true;
 
-    for (const item of collectRenderedTextCodeItems($text?.[0])) {
+    for (const item of collectRenderedCodeElementItems($text?.[0])) {
         if (renderKey && item.element.dataset.stftCodeTranslationKey !== renderKey) continue;
         const key = normalizeHtmlTextForMatch(item.element.textContent);
         const count = expected.get(key) || 0;
