@@ -224,6 +224,7 @@ const originalRenderCache = new Map();
 const translatedIframeObservers = new WeakMap();
 const translatedIframeLoadHandlers = new WeakMap();
 const renderedHtmlRetryStates = new Map();
+const renderedCodeRetryStates = new Map();
 
 function clone(value) {
     return JSON.parse(JSON.stringify(value));
@@ -1368,6 +1369,66 @@ function collectRenderedDomTextNodes(root) {
     return nodes;
 }
 
+function getRenderedCodeLanguage(element) {
+    if (!element) return '';
+    const classText = `${element.className || ''} ${element.closest('pre')?.className || ''}`;
+    const classMatch = classText.match(/(?:^|\s)(?:language|lang)-([\w-]+)/i);
+    if (classMatch?.[1]) return classMatch[1].toLowerCase();
+    return String(
+        element.dataset?.language
+        || element.closest('pre')?.dataset?.language
+        || '',
+    ).trim().toLowerCase();
+}
+
+function looksLikeNaturalLanguageCodeText(value) {
+    const text = String(value ?? '').trim();
+    if (!text || !/[\p{L}\p{N}]/u.test(text)) return false;
+    if (/<\/?[a-z][^>]*>|(?:^|\s)(?:function|class|const|let|var|import|export)\s|=>/im.test(text)) return false;
+    const letters = text.match(/\p{L}/gu)?.length || 0;
+    return letters >= 4;
+}
+
+function collectRenderedTextCodeItems(wrapper) {
+    if (!wrapper) return [];
+    const textLanguages = new Set([
+        'yaml', 'yml', 'markdown', 'md', 'text', 'txt', 'plaintext', 'plain',
+        'rst', 'asciidoc', 'adoc', 'toml', 'ini', 'properties', 'conf', 'config',
+        'log', 'csv', 'tsv',
+    ]);
+    const items = [];
+    const seenElements = new Set();
+
+    wrapper.querySelectorAll('pre').forEach(pre => {
+        if (pre.closest('.TH-render, .stft-fallback-render, .stft-html-code-source')) return;
+        const element = pre.querySelector('code') || pre;
+        if (seenElements.has(element)) return;
+        seenElements.add(element);
+
+        const raw = String(element.textContent ?? '');
+        const leading = raw.match(/^\s*/)?.[0] ?? '';
+        const trailing = raw.match(/\s*$/)?.[0] ?? '';
+        const core = raw.slice(leading.length, raw.length - trailing.length);
+        if (!core.trim()) return;
+        if (looksLikeFrontendHtmlCode(core) || looksLikeHtmlDocumentSource(core)) return;
+
+        const language = getRenderedCodeLanguage(element);
+        if (language && !textLanguages.has(language)) return;
+        if (!language && !looksLikeNaturalLanguageCodeText(core)) return;
+
+        items.push({
+            element,
+            source: core,
+            leading,
+            trailing,
+            language: language || 'text',
+            kind: 'rendered_code_text',
+        });
+    });
+
+    return items;
+}
+
 function collectHtmlCodeTranslationPlans(wrapper) {
     if (!wrapper) return [];
     const candidates = [];
@@ -1473,10 +1534,11 @@ function createRenderedDomTranslationPlan(messageId, sourceText = '') {
     const sourceHtml = wrapper.innerHTML;
     if (!sourceHtml) return null;
     const htmlCodePlans = collectHtmlCodeTranslationPlans(wrapper);
-    if (!htmlCodePlans.length && !hasRenderedDomTranslationStructure(wrapper, sourceText)) return null;
+    const textCodeItems = collectRenderedTextCodeItems(wrapper);
+    if (!htmlCodePlans.length && !textCodeItems.length && !hasRenderedDomTranslationStructure(wrapper, sourceText)) return null;
 
     const textNodes = collectRenderedDomTextNodes(wrapper);
-    if (!textNodes.length && !htmlCodePlans.length) return null;
+    if (!textNodes.length && !htmlCodePlans.length && !textCodeItems.length) return null;
     const segments = [];
     const planNodes = [];
     const renderedItems = [];
@@ -1506,9 +1568,13 @@ function createRenderedDomTranslationPlan(messageId, sourceText = '') {
         });
     }
 
-    if (htmlCodePlans.length) {
+    if (htmlCodePlans.length || textCodeItems.length) {
         const segmentItems = [
             ...renderedItems,
+            ...textCodeItems.map(item => ({
+                source: item.source,
+                kind: 'rendered_code_text',
+            })),
             ...htmlCodePlans.flatMap(plan => plan.segments.map(segment => ({
                 source: segment.source,
                 kind: 'html_text_node',
@@ -1527,6 +1593,7 @@ function createRenderedDomTranslationPlan(messageId, sourceText = '') {
                 segments: mixedSegments,
                 renderedCount: renderedItems.length,
                 htmlCodeMixed: true,
+                renderedCodeMixed: Boolean(textCodeItems.length),
             }
             : null;
     }
@@ -1613,9 +1680,14 @@ function createRenderedMixedTranslationPlan(messageId, sourceText = '') {
             kind: 'rendered_dom_text_node',
         });
     }
+    const textCodeItems = collectRenderedTextCodeItems(wrapper);
 
     const segmentItems = [
         ...renderedItems,
+        ...textCodeItems.map(item => ({
+            source: item.source,
+            kind: 'rendered_code_text',
+        })),
         ...iframePlans.flatMap(plan => plan.segments.map(segment => ({
             ...segment,
             kind: 'html_text_node',
@@ -1634,6 +1706,7 @@ function createRenderedMixedTranslationPlan(messageId, sourceText = '') {
         source: String(sourceText ?? ''),
         segments,
         renderedCount: renderedItems.length,
+        renderedCodeCount: textCodeItems.length,
         iframePlans,
     };
 }
@@ -1684,6 +1757,7 @@ function makeRenderedDomTranslationResult(plan, translatedSegments, targetLangua
 
 function makeRenderedMixedTranslationResult(plan, translatedSegments, targetLanguage, raw = '', usedFallback = false) {
     const renderedSegments = [];
+    const codeSegments = [];
     const htmlSegments = [];
 
     for (const segment of translatedSegments || []) {
@@ -1695,6 +1769,8 @@ function makeRenderedMixedTranslationResult(plan, translatedSegments, targetLang
         };
         if (segment.kind === 'rendered_dom_text_node') {
             renderedSegments.push(normalized);
+        } else if (segment.kind === 'rendered_code_text') {
+            codeSegments.push(normalized);
         } else if (segment.kind === 'html_text_node') {
             htmlSegments.push(normalized);
         }
@@ -1710,8 +1786,9 @@ function makeRenderedMixedTranslationResult(plan, translatedSegments, targetLang
     return {
         text,
         renderedMixed: true,
-        renderedDom: Boolean(renderedSegments.length),
+        renderedDom: Boolean(renderedSegments.length || codeSegments.length),
         renderedSegments,
+        codeSegments,
         htmlMode: Boolean(htmlSegments.length),
         mixedHtml: true,
         htmlSegments,
@@ -1722,6 +1799,7 @@ function makeRenderedMixedTranslationResult(plan, translatedSegments, targetLang
             kind: 'rendered_mixed',
             renderedMixed: true,
             renderedSegments,
+            codeSegments,
             htmlSegments,
         }],
         raw: String(raw ?? '').trim(),
@@ -1927,6 +2005,17 @@ function getStoredRenderedDomSegments(version) {
     const mixedSegment = version?.segments?.find(item => item.kind === 'rendered_mixed' || item.renderedMixed);
     if (Array.isArray(mixedSegment?.renderedSegments) && mixedSegment.renderedSegments.length) {
         return mixedSegment.renderedSegments;
+    }
+    return [];
+}
+
+function getStoredRenderedCodeSegments(version) {
+    if (Array.isArray(version?.codeSegments) && version.codeSegments.length) {
+        return version.codeSegments.filter(segment => !segment.kind || segment.kind === 'rendered_code_text');
+    }
+    const mixedSegment = version?.segments?.find(item => item.kind === 'rendered_mixed' || item.renderedMixed);
+    if (Array.isArray(mixedSegment?.codeSegments) && mixedSegment.codeSegments.length) {
+        return mixedSegment.codeSegments.filter(segment => !segment.kind || segment.kind === 'rendered_code_text');
     }
     return [];
 }
@@ -3004,17 +3093,114 @@ function applyRenderedTextSegmentsToCurrentDom($text, renderedSegments = []) {
     return changed;
 }
 
+function applyRenderedCodeSegmentsToCurrentDom($text, codeSegments = [], renderKey = '') {
+    if (!$text?.length || !Array.isArray(codeSegments) || !codeSegments.length) return false;
+    const queues = new Map();
+    for (const segment of codeSegments) {
+        const key = normalizeHtmlTextForMatch(segment.source);
+        const translation = String(segment.translation ?? segment.text ?? '').trim();
+        if (!key || !translation) continue;
+        if (!queues.has(key)) queues.set(key, []);
+        queues.get(key).push(translation);
+    }
+    if (!queues.size) return false;
+
+    let changed = false;
+    for (const item of collectRenderedTextCodeItems($text[0])) {
+        const key = normalizeHtmlTextForMatch(item.source);
+        const translation = queues.get(key)?.shift();
+        if (!translation) continue;
+        item.element.textContent = `${item.leading}${translation}${item.trailing}`;
+        if (renderKey) item.element.dataset.stftCodeTranslationKey = renderKey;
+        changed = true;
+    }
+    return changed;
+}
+
+function hasRenderedCodeTranslation($text, codeSegments = [], renderKey = '') {
+    const expected = new Map();
+    for (const segment of codeSegments || []) {
+        const translation = String(segment.translation ?? segment.text ?? '').trim();
+        const key = normalizeHtmlTextForMatch(translation);
+        if (!key) continue;
+        expected.set(key, (expected.get(key) || 0) + 1);
+    }
+    if (!expected.size) return true;
+
+    for (const item of collectRenderedTextCodeItems($text?.[0])) {
+        if (renderKey && item.element.dataset.stftCodeTranslationKey !== renderKey) continue;
+        const key = normalizeHtmlTextForMatch(item.element.textContent);
+        const count = expected.get(key) || 0;
+        if (count <= 0) continue;
+        if (count === 1) expected.delete(key);
+        else expected.set(key, count - 1);
+    }
+    return expected.size === 0;
+}
+
+function scheduleRenderedCodeRetry(messageId, renderKey) {
+    const retryKey = `${getMessageRecordKey(messageId)}::${renderKey}`;
+    if (renderedCodeRetryStates.has(retryKey)) return;
+
+    const delays = [30, 90, 220, 480];
+    const state = { attempt: 0, timer: 0 };
+    renderedCodeRetryStates.set(retryKey, state);
+
+    const retry = () => {
+        const { record } = getMessageRecord(messageId);
+        const version = getSelectedVersion(record);
+        const mode = record.displayMode || version?.displayMode || settings.displayMode;
+        const currentRenderKey = getTextRenderKey(messageId, mode, version);
+        if (!record.visible || currentRenderKey !== renderKey) {
+            renderedCodeRetryStates.delete(retryKey);
+            return;
+        }
+
+        const $text = getMessageElement(messageId).find('.mes_text').first();
+        const codeSegments = getStoredRenderedCodeSegments(version);
+        if (!$text.length || !codeSegments.length || hasRenderedCodeTranslation($text, codeSegments, renderKey)) {
+            renderedCodeRetryStates.delete(retryKey);
+            return;
+        }
+
+        $text.removeAttr('data-stft-render-key');
+        applyDisplay(messageId);
+        if (hasRenderedCodeTranslation($text, codeSegments, renderKey)) {
+            renderedCodeRetryStates.delete(retryKey);
+            return;
+        }
+
+        state.attempt += 1;
+        if (state.attempt >= delays.length) {
+            renderedCodeRetryStates.delete(retryKey);
+            return;
+        }
+        state.timer = window.setTimeout(retry, delays[state.attempt]);
+    };
+
+    state.timer = window.setTimeout(retry, delays[0]);
+}
+
 function applyRenderedMixedVersionDisplay(messageId, version, renderKey) {
     const $text = getMessageElement(messageId).find('.mes_text').first();
     if (!$text.length) return false;
     rememberOriginalRender(messageId, $text);
 
     const renderedSegments = getStoredRenderedDomSegments(version);
+    const codeSegments = getStoredRenderedCodeSegments(version);
     const htmlSegments = getHtmlVersionSegments(version);
     let changed = false;
 
     if (renderedSegments.length) {
         changed = applyRenderedTextSegmentsToCurrentDom($text, renderedSegments) || changed;
+    }
+    if (codeSegments.length) {
+        const codeChanged = applyRenderedCodeSegmentsToCurrentDom($text, codeSegments, renderKey);
+        changed = codeChanged || changed;
+        if (!codeChanged && !hasRenderedCodeTranslation($text, codeSegments, renderKey)) {
+            scheduleRenderedCodeRetry(messageId, renderKey);
+            changed = true;
+        }
     }
 
     if (htmlSegments.length) {
@@ -3095,7 +3281,10 @@ function applyDisplay(messageId) {
     if ($text.attr('data-stft-render-key') === renderKey) {
         if (renderedMixedVersion) {
             const htmlSegments = getHtmlVersionSegments(version);
-            if (!htmlSegments.length || hasRenderedIframeTranslation($text, renderKey)) {
+            const codeSegments = getStoredRenderedCodeSegments(version);
+            const htmlReady = !htmlSegments.length || hasRenderedIframeTranslation($text, renderKey);
+            const codeReady = !codeSegments.length || hasRenderedCodeTranslation($text, codeSegments, renderKey);
+            if (htmlReady && codeReady) {
                 updateButtonState($mes);
                 return;
             }
@@ -3378,7 +3567,7 @@ function applyTranslationResultToVersion(version, result) {
     version.segments = Array.isArray(result.segments) ? result.segments : version.segments;
     version.usedFallback = Boolean(result.usedFallback);
 
-    for (const key of ['htmlSegments', 'htmlMode', 'mixedHtml', 'renderedDom', 'renderedSegments', 'renderedMixed']) {
+    for (const key of ['htmlSegments', 'htmlMode', 'mixedHtml', 'renderedDom', 'renderedSegments', 'codeSegments', 'renderedMixed']) {
         if (result[key] !== undefined) {
             version[key] = result[key];
         } else {
@@ -3506,6 +3695,7 @@ function buildMessages(sourceText, language, presetId, sourceSegments = getSourc
     const prompt = getPromptById(presetId);
     const isHtmlNodeMode = sourceSegments.some(segment => segment.kind === 'html_text_node');
     const isRenderedDomMode = sourceSegments.some(segment => segment.kind === 'rendered_dom_text_node');
+    const isRenderedCodeMode = sourceSegments.some(segment => segment.kind === 'rendered_code_text');
     const payload = {
         source_language: sourceLanguage,
         target_language: targetLanguage,
@@ -3521,6 +3711,7 @@ function buildMessages(sourceText, language, presetId, sourceSegments = getSourc
             `只有某段本来就已经是${targetLanguage}，或者它只是专名、代码、标记、章节编号等不应翻译内容时，才可以原样复制。`,
             isHtmlNodeMode ? '这些 segments 来自 HTML 美化界面的可见文本节点，或来自脚本里运行时会显示到界面的自然语言文案。只翻译 source_text 的自然语言文字，不要返回 HTML 标签、属性、CSS、JavaScript 或 Markdown 代码块。' : '',
             isRenderedDomMode ? 'These segments come from an already-rendered SillyTavern chat display after Regex/display replacements. Translate only the visible natural-language text in source_text. Do not return HTML, CSS, JavaScript, Markdown fences, regex trigger syntax, or wrapper markup.' : '',
+            isRenderedCodeMode ? '这些 segments 是 YAML、Markdown 或纯文本代码块内部的展示文字。保留原有换行、缩进、列表符号、YAML 冒号和 Markdown 标记，只翻译其中的自然语言，不要添加或返回外层反引号围栏。' : '',
             forceTranslate ? `上一轮返回疑似照抄原文。请重新翻译，普通叙事和对话必须变成${targetLanguage}。` : '',
         ].filter(Boolean),
         segments: compact
