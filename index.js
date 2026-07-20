@@ -11,7 +11,7 @@ const LEGACY_TOGGLE_CLASS = 'stft-toggle-button';
 const LEGACY_PANEL_CLASS = 'stft-panel-button';
 const ACTIVE_CLASS = 'stft-button-active';
 const LOADING_CLASS = 'stft-button-loading';
-const DISPLAY_RENDER_REVISION = 'html-iframe-text-v2';
+const DISPLAY_RENDER_REVISION = 'html-iframe-text-v3';
 
 const displayModes = {
     replace: 'replace',
@@ -1406,6 +1406,34 @@ function looksLikeNaturalLanguageCodeText(value) {
     return letters >= 4;
 }
 
+function inferStructuredTextCodeLanguage(value) {
+    const text = String(value ?? '').trim();
+    if (!text || !/[\p{L}\p{N}]/u.test(text)) return '';
+
+    if (/^[\[{]/.test(text) && /"[^"\r\n]+"\s*:/.test(text)) {
+        return 'json';
+    }
+
+    const meaningfulLines = getCodeSourceLines(text)
+        .map(line => line.text)
+        .filter(line => line.trim());
+    const yamlMappingCount = meaningfulLines.filter(line => (
+        /^\s*(?:[-?]\s+)?(?:[A-Za-z_][\w.-]*|"[^"\r\n]+"|'[^'\r\n]+')\s*:\s*/.test(line)
+    )).length;
+    const hasYamlStructure = /(?:^|\n)\s*(?:[-?]\s+)?(?:content|trigger|metadata|sections|uid|type|position|title)\s*:/i.test(text)
+        || /:\s*[>|][+-]?\s*(?:\r?\n|$)/.test(text)
+        || /<\/?[A-Za-z_][\w:.-]*\s*>/.test(text);
+    if (yamlMappingCount >= 2 || (yamlMappingCount >= 1 && (hasYamlStructure || meaningfulLines.length <= 3))) {
+        return 'yaml';
+    }
+
+    const markdownLineCount = meaningfulLines.filter(line => (
+        /^\s*(?:#{1,6}\s+|>\s+|[-*+]\s+|\d+[.)]\s+)/.test(line)
+    )).length;
+    if (markdownLineCount >= 2) return 'markdown';
+    return '';
+}
+
 function getCodeSourceLines(sourceText) {
     const source = String(sourceText ?? '');
     const lines = [];
@@ -1927,14 +1955,23 @@ function collectRenderedCodeElementItems(wrapper) {
     return items;
 }
 
+function resolveRenderedTextCodeLanguage(candidate) {
+    const declaredLanguage = String(candidate?.language || '').trim().toLowerCase();
+    const source = String(candidate?.source ?? '');
+    if (declaredLanguage) {
+        return isStructuredTextCodeLanguage(declaredLanguage) ? declaredLanguage : '';
+    }
+    if (looksLikeFrontendHtmlCode(source) || looksLikeHtmlDocumentSource(source)) return '';
+    return inferStructuredTextCodeLanguage(source)
+        || (looksLikeNaturalLanguageCodeText(source) ? 'text' : '');
+}
+
 function collectRenderedTextCodeItems(wrapper) {
     const items = [];
     for (const candidate of collectRenderedCodeElementItems(wrapper)) {
         const { element, source: core, leading, trailing } = candidate;
-        const language = candidate.language;
-        if (language && !isStructuredTextCodeLanguage(language)) continue;
-        if (!language && (looksLikeFrontendHtmlCode(core) || looksLikeHtmlDocumentSource(core))) continue;
-        if (!language && !looksLikeNaturalLanguageCodeText(core)) continue;
+        const language = resolveRenderedTextCodeLanguage(candidate);
+        if (!language) continue;
         const translationPlan = createStructuredTextCodePlan(core, language || 'text');
         if (!translationPlan?.parts?.length) continue;
 
@@ -1950,6 +1987,17 @@ function collectRenderedTextCodeItems(wrapper) {
     }
 
     return items;
+}
+
+function replaceRenderedCodeElementText(item, translatedText) {
+    const element = item?.element;
+    if (!element) return;
+
+    const copyButtons = Array.from(element.children || [])
+        .filter(child => child.classList?.contains('code-copy'));
+    copyButtons.forEach(button => button.remove());
+    element.textContent = `${item.leading}${translatedText}${item.trailing}`;
+    copyButtons.forEach(button => element.appendChild(button));
 }
 
 function collectHtmlCodeTranslationPlans(wrapper) {
@@ -3673,13 +3721,9 @@ function applyRenderedCodeSegmentsToCurrentDom($text, codeSegments = [], renderK
     if (!pending.length) return false;
 
     let changed = false;
-    const renderedItems = collectRenderedCodeElementItems($text[0]).filter(item => (
-        item.language
-            ? isStructuredTextCodeLanguage(item.language)
-            : (!looksLikeFrontendHtmlCode(item.source)
-                && !looksLikeHtmlDocumentSource(item.source)
-                && looksLikeNaturalLanguageCodeText(item.source))
-    ));
+    const renderedItems = collectRenderedCodeElementItems($text[0])
+        .map(item => ({ ...item, language: resolveRenderedTextCodeLanguage(item) }))
+        .filter(item => item.language);
     for (const [itemIndex, item] of renderedItems.entries()) {
         const currentSourceKey = hashText(normalizeHtmlTextForMatch(item.source));
         const sourceKey = item.element.dataset.stftCodeSourceKey || currentSourceKey;
@@ -3693,7 +3737,7 @@ function applyRenderedCodeSegmentsToCurrentDom($text, codeSegments = [], renderK
         }
         if (!match) continue;
         match.used = true;
-        item.element.textContent = `${item.leading}${match.translation}${item.trailing}`;
+        replaceRenderedCodeElementText(item, match.translation);
         item.element.dataset.stftCodeSourceKey = match.sourceKey;
         if (renderKey) item.element.dataset.stftCodeTranslationKey = renderKey;
         changed = true;
