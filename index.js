@@ -11,7 +11,8 @@ const LEGACY_TOGGLE_CLASS = 'stft-toggle-button';
 const LEGACY_PANEL_CLASS = 'stft-panel-button';
 const ACTIVE_CLASS = 'stft-button-active';
 const LOADING_CLASS = 'stft-button-loading';
-const DISPLAY_RENDER_REVISION = 'html-iframe-text-v4';
+const DISPLAY_RENDER_REVISION = 'html-iframe-text-v5';
+const IFRAME_RENDER_ENDED_EVENT = 'message_iframe_render_ended';
 
 const displayModes = {
     replace: 'replace',
@@ -229,6 +230,7 @@ const fallbackPromotionObservers = new WeakMap();
 const renderedHtmlRetryStates = new Map();
 const renderedCodeRetryStates = new Map();
 const nativeMessageRenderSchedules = new Map();
+const renderedIframeRefreshSchedules = new Map();
 
 function clone(value) {
     return JSON.parse(JSON.stringify(value));
@@ -351,6 +353,14 @@ function getEventMessageId(payload) {
         return payload.messageId ?? payload.id ?? payload.mesId;
     }
     return payload;
+}
+
+function getRenderedIframeMessageId(payload) {
+    const iframeName = payload && typeof payload === 'object'
+        ? payload.iframeName ?? payload.name ?? payload.id
+        : payload;
+    const match = String(iframeName ?? '').match(/^TH-message--(\d+)--/);
+    return match?.[1] ?? null;
 }
 
 function getReplyLabel(messageId) {
@@ -3090,6 +3100,32 @@ function scheduleNativeMessageRendered(messageId) {
     }, 260));
 }
 
+function scheduleRenderedIframeTranslationRefresh(messageId) {
+    if (messageId === undefined || messageId === null || messageId === '') return;
+    const chatKey = getChatKey();
+    const recordKey = getMessageRecordKey(messageId);
+    const scheduleKey = `${chatKey}::${recordKey}`;
+    if (renderedIframeRefreshSchedules.has(scheduleKey)) return;
+
+    const timer = window.setTimeout(() => {
+        renderedIframeRefreshSchedules.delete(scheduleKey);
+        if (getChatKey() !== chatKey || getMessageRecordKey(messageId) !== recordKey) return;
+
+        const record = loadStore().messages[recordKey];
+        const version = getSelectedVersion(record);
+        if (!record?.visible || !version) return;
+        if (!isHtmlDocumentVersion(version) && !isRenderedMixedVersion(version)) return;
+
+        const $text = getMessageElement(messageId).find('.mes_text').first();
+        if (!$text.length) return;
+        const mode = record.displayMode || version.displayMode || settings.displayMode;
+        const renderKey = getTextRenderKey(messageId, mode, version);
+        if (hasRenderedIframeTranslation($text, renderKey)) return;
+        applyDisplay(messageId);
+    }, 0);
+    renderedIframeRefreshSchedules.set(scheduleKey, timer);
+}
+
 function waitForRenderFrame(delay = 80) {
     return new Promise(resolve => {
         const finish = () => setTimeout(resolve, delay);
@@ -3472,6 +3508,51 @@ function applyHtmlSegmentsToDocument(doc, htmlSegments, options = {}) {
     return changed;
 }
 
+function documentContainsHtmlTranslations(doc, htmlSegments) {
+    if (!doc?.body) return false;
+
+    const expectedTranslations = new Set();
+    const unchangedTranslations = new Set();
+    for (const segment of htmlSegments || []) {
+        const source = normalizeHtmlTextForMatch(segment?.source);
+        const translation = normalizeHtmlTextForMatch(segment?.translation ?? segment?.text);
+        if (!source || !translation) continue;
+        if (source === translation) unchangedTranslations.add(translation);
+        else expectedTranslations.add(translation);
+    }
+    if (!expectedTranslations.size && !unchangedTranslations.size) return false;
+
+    const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+            return shouldTranslateRenderedIframeTextNode(node)
+                ? NodeFilter.FILTER_ACCEPT
+                : NodeFilter.FILTER_REJECT;
+        },
+    });
+
+    let node;
+    while ((node = walker.nextNode())) {
+        const key = normalizeHtmlTextForMatch(node.nodeValue);
+        if (expectedTranslations.has(key)) return true;
+        if (!expectedTranslations.size && unchangedTranslations.has(key)) return true;
+    }
+    return false;
+}
+
+function markRenderedIframeTranslationReady(iframe, htmlSegments, renderKey, changed = false) {
+    if (!changed && iframe.dataset.stftTranslationReadyKey === renderKey) return true;
+    let doc;
+    try {
+        doc = iframe.contentDocument;
+    } catch {
+        return false;
+    }
+    const ready = Boolean(changed) || documentContainsHtmlTranslations(doc, htmlSegments);
+    if (ready) iframe.dataset.stftTranslationReadyKey = renderKey;
+    else if (iframe.dataset.stftTranslationReadyKey === renderKey) delete iframe.dataset.stftTranslationReadyKey;
+    return ready;
+}
+
 function resizeTranslatedIframe(iframe) {
     try {
         const doc = iframe.contentDocument;
@@ -3536,6 +3617,7 @@ function installTranslatedIframeLoadHandler(iframe, htmlSegments, renderKey) {
 
     const handler = () => {
         if (iframe.dataset.stftTranslationKey !== renderKey) return;
+        delete iframe.dataset.stftTranslationReadyKey;
         let doc;
         try {
             doc = iframe.contentDocument;
@@ -3546,6 +3628,7 @@ function installTranslatedIframeLoadHandler(iframe, htmlSegments, renderKey) {
 
         disconnectTranslatedIframeObserver(iframe);
         const changed = applyHtmlSegmentsToDocument(doc, htmlSegments, { repeat: true });
+        markRenderedIframeTranslationReady(iframe, htmlSegments, renderKey, changed);
         installTranslatedIframeObserver(iframe, htmlSegments, renderKey);
         if (changed) {
             stabilizeTranslatedIframeLayout(iframe);
@@ -3586,6 +3669,7 @@ function installTranslatedIframeObserver(iframe, htmlSegments, renderKey) {
             return;
         }
         const changed = applyHtmlSegmentsToDocument(frameDoc, htmlSegments, { repeat: true });
+        markRenderedIframeTranslationReady(iframe, htmlSegments, renderKey, changed);
         if (changed) {
             stabilizeTranslatedIframeLayout(iframe);
             scheduleTranslatedIframeResize(iframe);
@@ -3614,10 +3698,14 @@ function applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey) {
     }
     if (!doc?.body) return false;
 
+    if (iframe.dataset.stftTranslationKey !== renderKey) {
+        delete iframe.dataset.stftTranslationReadyKey;
+    }
     iframe.dataset.stftTranslationKey = renderKey;
     installTranslatedIframeLoadHandler(iframe, htmlSegments, renderKey);
     installTranslatedIframeObserver(iframe, htmlSegments, renderKey);
     const changed = applyHtmlSegmentsToDocument(doc, htmlSegments, { repeat: false });
+    markRenderedIframeTranslationReady(iframe, htmlSegments, renderKey, changed);
     if (changed) {
         stabilizeTranslatedIframeLayout(iframe);
         scheduleTranslatedIframeResize(iframe);
@@ -3666,6 +3754,7 @@ function restoreHtmlSegmentsInRenderedIframe(iframe, htmlSegments) {
     }
 
     delete iframe.dataset.stftTranslationKey;
+    delete iframe.dataset.stftTranslationReadyKey;
     removeTranslatedIframeLayout(iframe);
     if (!changed) return false;
     return true;
@@ -3673,7 +3762,7 @@ function restoreHtmlSegmentsInRenderedIframe(iframe, htmlSegments) {
 
 function hasRenderedIframeTranslation($text, renderKey) {
     const frames = findRenderedHtmlIframes($text);
-    return Boolean(frames.length) && frames.every(iframe => iframe.dataset?.stftTranslationKey === renderKey);
+    return Boolean(frames.length) && frames.every(iframe => iframe.dataset?.stftTranslationReadyKey === renderKey);
 }
 
 function scheduleRenderedHtmlRetry(messageId, renderKey) {
@@ -3754,9 +3843,8 @@ function applyRenderedHtmlDocumentDisplay(messageId, htmlSegments, renderKey) {
     for (const iframe of iframes) {
         armed = applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey) || armed;
     }
-    if (!armed) {
+    if (!armed || !hasRenderedIframeTranslation($text, renderKey)) {
         scheduleRenderedHtmlRetry(messageId, renderKey);
-        return true;
     }
     prependInlineToggleIfNeeded(messageId, $text, true, true);
     $text.attr('data-stft-render-key', renderKey);
@@ -3944,7 +4032,9 @@ function applyRenderedMixedVersionDisplay(messageId, version, renderKey) {
                     armed = applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey) || armed;
                 }
                 changed = armed || changed;
-                if (!armed) scheduleRenderedHtmlRetry(messageId, renderKey);
+                if (!armed || !hasRenderedIframeTranslation($text, renderKey)) {
+                    scheduleRenderedHtmlRetry(messageId, renderKey);
+                }
             } else {
                 scheduleRenderedHtmlRetry(messageId, renderKey);
                 changed = true;
@@ -6512,6 +6602,10 @@ function bindEvents() {
             queueScan({ messageId: getEventMessageId(payload) });
         });
     }
+    eventSource.on(IFRAME_RENDER_ENDED_EVENT, payload => {
+        const messageId = getRenderedIframeMessageId(payload);
+        if (messageId !== null) scheduleRenderedIframeTranslationRefresh(messageId);
+    });
     eventSource.on(event_types.CHAT_CHANGED, () => queueScan({ full: true, prune: true }));
     eventSource.on(event_types.MESSAGE_UPDATED, payload => {
         const messageId = getEventMessageId(payload);
