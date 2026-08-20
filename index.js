@@ -11,7 +11,7 @@ const LEGACY_TOGGLE_CLASS = 'stft-toggle-button';
 const LEGACY_PANEL_CLASS = 'stft-panel-button';
 const ACTIVE_CLASS = 'stft-button-active';
 const LOADING_CLASS = 'stft-button-loading';
-const DISPLAY_RENDER_REVISION = 'html-iframe-text-v3';
+const DISPLAY_RENDER_REVISION = 'html-iframe-text-v4';
 
 const displayModes = {
     replace: 'replace',
@@ -48,6 +48,7 @@ const translationChannels = {
 };
 
 const BUILTIN_TRANSLATE_SWIPE_GUARD_KEY = '__floorTranslatorSwipeGuardInstalled';
+const NATIVE_RENDER_SOURCE = 'floor_translator';
 const builtinTranslateIncomingModes = new Set(['responses', 'both']);
 const machineConcurrency = 4;
 const googleChunkLength = 1300;
@@ -223,8 +224,11 @@ const mutedLiveDisplays = new Set();
 const originalRenderCache = new Map();
 const translatedIframeObservers = new WeakMap();
 const translatedIframeLoadHandlers = new WeakMap();
+const fallbackIframeResizeObservers = new WeakMap();
+const fallbackPromotionObservers = new WeakMap();
 const renderedHtmlRetryStates = new Map();
 const renderedCodeRetryStates = new Map();
+const nativeMessageRenderSchedules = new Map();
 
 function clone(value) {
     return JSON.parse(JSON.stringify(value));
@@ -3060,16 +3064,30 @@ function emitNativeMessageRendered(messageId) {
     if (!message) return;
     const eventName = message.is_user ? event_types.USER_MESSAGE_RENDERED : event_types.CHARACTER_MESSAGE_RENDERED;
     try {
-        void eventSource.emit(eventName, Number(messageId), 'floor_translator');
+        void eventSource.emit(eventName, Number(messageId), NATIVE_RENDER_SOURCE);
     } catch (error) {
         console.warn('[Floor Translator] message rendered event failed', error);
     }
 }
 
 function scheduleNativeMessageRendered(messageId) {
-    emitNativeMessageRendered(messageId);
-    setTimeout(() => emitNativeMessageRendered(messageId), 80);
-    setTimeout(() => emitNativeMessageRendered(messageId), 260);
+    const chatKey = getChatKey();
+    const recordKey = getMessageRecordKey(messageId);
+    const scheduleKey = `${chatKey}::${recordKey}`;
+    if (nativeMessageRenderSchedules.has(scheduleKey)) return;
+
+    const timers = [];
+    const emitIfCurrent = () => {
+        if (getChatKey() !== chatKey || getMessageRecordKey(messageId) !== recordKey) return;
+        emitNativeMessageRendered(messageId);
+    };
+    nativeMessageRenderSchedules.set(scheduleKey, timers);
+    emitIfCurrent();
+    timers.push(setTimeout(emitIfCurrent, 80));
+    timers.push(setTimeout(() => {
+        emitIfCurrent();
+        nativeMessageRenderSchedules.delete(scheduleKey);
+    }, 260));
 }
 
 function waitForRenderFrame(delay = 80) {
@@ -3097,9 +3115,12 @@ async function prepareMessageRenderForTranslation(messageId) {
     }
 
     await waitForRenderFrame(90);
-    renderFallbackFrontendCodeBlocks(messageId);
     scheduleNativeMessageRendered(messageId);
-    await waitForRenderFrame(90);
+    await waitForRenderFrame(230);
+    const $freshText = getMessageElement(messageId).find('.mes_text').first();
+    if ($freshText.length && !findRenderedHtmlIframes($freshText).length && !$freshText.find('.TH-render').length) {
+        renderFallbackFrontendCodeBlocks(messageId);
+    }
 }
 
 function looksLikeFrontendHtmlCode(value) {
@@ -3123,6 +3144,66 @@ function resizeFallbackIframe(iframe) {
     }
 }
 
+function disconnectFallbackIframeResizeObserver(iframe) {
+    const observer = fallbackIframeResizeObservers.get(iframe);
+    if (!observer) return;
+    try {
+        observer.disconnect();
+    } catch {
+        // Ignore stale fallback iframe observers.
+    }
+    fallbackIframeResizeObservers.delete(iframe);
+}
+
+function removeFallbackIframe(iframe) {
+    if (!iframe) return;
+    disconnectFallbackIframeResizeObserver(iframe);
+    disconnectTranslatedIframeObserver(iframe);
+    disconnectTranslatedIframeLoadHandler(iframe);
+    iframe.remove();
+}
+
+function getNativeFramesInsideFallback(wrapper) {
+    return Array.from(wrapper?.querySelectorAll?.('.TH-render iframe, iframe.stft-html-frame') || [])
+        .filter(iframe => !iframe.classList.contains('stft-fallback-iframe'));
+}
+
+function promoteNativeRendererOverFallback(wrapper) {
+    if (!wrapper?.isConnected || !getNativeFramesInsideFallback(wrapper).length) return false;
+
+    wrapper.querySelectorAll('iframe.stft-fallback-iframe').forEach(removeFallbackIframe);
+    const observer = fallbackPromotionObservers.get(wrapper);
+    observer?.disconnect?.();
+    fallbackPromotionObservers.delete(wrapper);
+    wrapper.replaceWith(...Array.from(wrapper.childNodes));
+    return true;
+}
+
+function observeFallbackPromotion(wrapper) {
+    if (!wrapper || fallbackPromotionObservers.has(wrapper) || typeof MutationObserver === 'undefined') return;
+    const observer = new MutationObserver(() => {
+        if (promoteNativeRendererOverFallback(wrapper)) return;
+        if (!wrapper.isConnected) {
+            observer.disconnect();
+            fallbackPromotionObservers.delete(wrapper);
+        }
+    });
+    observer.observe(wrapper, { childList: true, subtree: true });
+    fallbackPromotionObservers.set(wrapper, observer);
+    setTimeout(() => {
+        if (fallbackPromotionObservers.get(wrapper) !== observer) return;
+        observer.disconnect();
+        fallbackPromotionObservers.delete(wrapper);
+    }, 8000);
+}
+
+function reconcileFallbackRenderers($text) {
+    if (!$text?.length) return;
+    $text.find('.stft-fallback-render').each((_index, wrapper) => {
+        promoteNativeRendererOverFallback(wrapper);
+    });
+}
+
 function mountFallbackFrontendIframe(pre, code) {
     const $pre = $(pre);
     if ($pre.closest('.TH-render').length || $pre.closest('.stft-fallback-render').length) return;
@@ -3139,8 +3220,10 @@ function mountFallbackFrontendIframe(pre, code) {
         try {
             const doc = iframe.contentDocument;
             if (doc && typeof ResizeObserver !== 'undefined') {
+                disconnectFallbackIframeResizeObserver(iframe);
                 const observer = new ResizeObserver(() => resizeFallbackIframe(iframe));
                 if (doc.body) observer.observe(doc.body);
+                fallbackIframeResizeObservers.set(iframe, observer);
             }
         } catch {
             // Cross-document sizing can fail on unusual mobile WebViews.
@@ -3149,7 +3232,9 @@ function mountFallbackFrontendIframe(pre, code) {
 
     $pre.wrap('<div class="stft-fallback-render"></div>');
     $pre.addClass('stft-fallback-source').hide();
-    $pre.parent().append(iframe);
+    const wrapper = $pre.parent()[0];
+    $(wrapper).append(iframe);
+    observeFallbackPromotion(wrapper);
 }
 
 function renderFallbackFrontendCodeBlocks(messageId) {
@@ -3266,7 +3351,12 @@ function normalizeHtmlTextForMatch(value) {
 }
 
 function findRenderedHtmlIframes($text) {
-    const frames = $text.find('.TH-render iframe, iframe.stft-html-frame, iframe.stft-fallback-iframe').toArray();
+    reconcileFallbackRenderers($text);
+    const frames = Array.from(new Set([
+        ...$text.find('.TH-render iframe, iframe.stft-html-frame').toArray()
+            .filter(iframe => !iframe.classList.contains('stft-fallback-iframe')),
+        ...$text.find('iframe.stft-fallback-iframe').toArray(),
+    ]));
     return frames.filter(iframe => {
         try {
             return Boolean(iframe.contentDocument?.body);
@@ -3594,7 +3684,6 @@ function scheduleRenderedHtmlRetry(messageId, renderKey) {
     const state = { attempt: 0, timer: 0 };
     renderedHtmlRetryStates.set(retryKey, state);
     scheduleNativeMessageRendered(messageId);
-    renderFallbackFrontendCodeBlocks(messageId);
 
     const retry = () => {
         const { record } = getMessageRecord(messageId);
@@ -3610,7 +3699,7 @@ function scheduleRenderedHtmlRetry(messageId, renderKey) {
             renderedHtmlRetryStates.delete(retryKey);
             return;
         }
-        renderFallbackFrontendCodeBlocks(messageId);
+        reconcileFallbackRenderers($text);
         if (hasRenderedIframeTranslation($text, renderKey)) {
             renderedHtmlRetryStates.delete(retryKey);
             return;
@@ -3623,6 +3712,15 @@ function scheduleRenderedHtmlRetry(messageId, renderKey) {
         }
 
         state.attempt += 1;
+        if (state.attempt >= 3 && !$text.find('.TH-render').length) {
+            renderFallbackFrontendCodeBlocks(messageId);
+            $text.removeAttr('data-stft-render-key');
+            applyDisplay(messageId);
+            if (hasRenderedIframeTranslation($text, renderKey)) {
+                renderedHtmlRetryStates.delete(retryKey);
+                return;
+            }
+        }
         if (state.attempt >= delays.length) {
             renderedHtmlRetryStates.delete(retryKey);
             return;
@@ -6409,7 +6507,10 @@ function bindEvents() {
         event_types.USER_MESSAGE_RENDERED,
     ];
     for (const eventName of eventsToScan) {
-        eventSource.on(eventName, payload => queueScan({ messageId: getEventMessageId(payload) }));
+        eventSource.on(eventName, (payload, renderSource) => {
+            if (renderSource === NATIVE_RENDER_SOURCE) return;
+            queueScan({ messageId: getEventMessageId(payload) });
+        });
     }
     eventSource.on(event_types.CHAT_CHANGED, () => queueScan({ full: true, prune: true }));
     eventSource.on(event_types.MESSAGE_UPDATED, payload => {
