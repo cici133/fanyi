@@ -56,6 +56,10 @@ const googleChunkLength = 1300;
 const googleBatchMaxSegments = 18;
 const googleBatchMaxChars = googleChunkLength;
 const googleBatchMarkerRegex = /\s*⟦\s*\d{6}\s*⟧\s*/gu;
+const googleRequestTimeoutMs = 12000;
+const googleSameOriginCooldownMs = 5 * 60 * 1000;
+const googleSameOriginFailureCooldownMs = 30 * 1000;
+const googleRecoveryDelayMs = 450;
 const aiBatchMaxSegments = 320;
 const aiBatchMaxChars = 20000;
 const aiRateLimitRetryDelays = [1800, 4200, 9000];
@@ -231,6 +235,9 @@ const renderedHtmlRetryStates = new Map();
 const renderedCodeRetryStates = new Map();
 const nativeMessageRenderSchedules = new Map();
 const renderedIframeRefreshSchedules = new Map();
+let googlePreferSameOriginUntil = 0;
+let googleBypassSameOriginUntil = 0;
+let googleSameOriginRouteUnavailable = false;
 
 function clone(value) {
     return JSON.parse(JSON.stringify(value));
@@ -5107,6 +5114,183 @@ function splitMachineRequestChunks(text, maxLength = googleChunkLength) {
     return chunks.filter(Boolean);
 }
 
+function makeGoogleTransportError(transport, message, options = {}) {
+    const error = new Error(message);
+    error.googleTransport = transport;
+    error.googleStatus = Number(options.status || 0);
+    error.googleNetworkError = Boolean(options.network);
+    return error;
+}
+
+async function fetchGoogleWithTimeout(url, init, transport) {
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = controller
+        ? window.setTimeout(() => controller.abort(), googleRequestTimeoutMs)
+        : 0;
+    try {
+        return await fetch(url, {
+            ...init,
+            ...(controller ? { signal: controller.signal } : {}),
+        });
+    } catch (error) {
+        const timedOut = Boolean(controller?.signal?.aborted);
+        const detail = timedOut
+            ? `请求超过 ${Math.round(googleRequestTimeoutMs / 1000)} 秒`
+            : (error?.message || String(error));
+        const label = transport === 'same-origin' ? '酒馆同源通道' : '浏览器直连';
+        throw makeGoogleTransportError(transport, `${label}：${detail}`, { network: true });
+    } finally {
+        if (timer) window.clearTimeout(timer);
+    }
+}
+
+async function readGoogleResponseText(response, transport) {
+    try {
+        return await response.text();
+    } catch (error) {
+        const label = transport === 'same-origin' ? '酒馆同源通道' : '浏览器直连';
+        throw makeGoogleTransportError(
+            transport,
+            `${label}读取响应时中断：${error?.message || String(error)}`,
+            { network: true },
+        );
+    }
+}
+
+async function translateWithGoogleSameOrigin(text, target, source) {
+    const response = await fetchGoogleWithTimeout('/api/translate/google', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        cache: 'no-store',
+        body: JSON.stringify({ text, lang: target, source }),
+    }, 'same-origin');
+    const raw = await readGoogleResponseText(response, 'same-origin');
+    if (!response.ok) {
+        throw makeGoogleTransportError(
+            'same-origin',
+            `酒馆同源通道 ${response.status}：${compactHttpError(raw, response.statusText)}`,
+            { status: response.status },
+        );
+    }
+    const translated = decodeHtmlEntities(raw.trim());
+    if (!translated) {
+        throw makeGoogleTransportError('same-origin', '酒馆同源通道没有返回译文。');
+    }
+    return translated;
+}
+
+async function translateWithGoogleDirect(text, target, source) {
+    const url = new URL('https://translate.googleapis.com/translate_a/single');
+    url.searchParams.set('client', 'gtx');
+    url.searchParams.set('sl', source);
+    url.searchParams.set('tl', target);
+    url.searchParams.set('dt', 't');
+    url.searchParams.set('q', text);
+
+    const response = await fetchGoogleWithTimeout(url.toString(), {
+        method: 'GET',
+        mode: 'cors',
+        credentials: 'omit',
+        cache: 'no-store',
+    }, 'direct');
+    const raw = await readGoogleResponseText(response, 'direct');
+    if (!response.ok) {
+        throw makeGoogleTransportError(
+            'direct',
+            `浏览器直连 ${response.status}：${compactHttpError(raw, response.statusText)}`,
+            { status: response.status },
+        );
+    }
+
+    let data;
+    try {
+        data = JSON.parse(raw);
+    } catch {
+        throw makeGoogleTransportError('direct', '浏览器直连返回了无法解析的内容。');
+    }
+
+    const translated = Array.isArray(data?.[0])
+        ? data[0].map(part => part?.[0] || '').join('')
+        : '';
+    if (!translated.trim()) {
+        throw makeGoogleTransportError('direct', '浏览器直连没有返回译文。');
+    }
+    return decodeHtmlEntities(translated.trim());
+}
+
+function updateGoogleTransportState(transport, succeeded, error = null) {
+    const now = Date.now();
+    if (transport === 'same-origin') {
+        if (succeeded) {
+            googleBypassSameOriginUntil = 0;
+            googlePreferSameOriginUntil = now + googleSameOriginCooldownMs;
+            return;
+        }
+        if ([404, 405, 501].includes(Number(error?.googleStatus || 0))) {
+            googleSameOriginRouteUnavailable = true;
+            return;
+        }
+        googleBypassSameOriginUntil = now + googleSameOriginFailureCooldownMs;
+        return;
+    }
+
+    if (!succeeded) {
+        googlePreferSameOriginUntil = now + googleSameOriginCooldownMs;
+    }
+}
+
+function getGoogleTransportOrder(source) {
+    const now = Date.now();
+    const sameOriginAllowed = !googleSameOriginRouteUnavailable && now >= googleBypassSameOriginUntil;
+    const preferSameOrigin = sameOriginAllowed
+        && (source === 'auto' || now < googlePreferSameOriginUntil);
+    if (preferSameOrigin) return ['same-origin', 'direct'];
+    return sameOriginAllowed ? ['direct', 'same-origin'] : ['direct'];
+}
+
+async function requestGoogleTranslation(text, target, source) {
+    const errors = [];
+    const attempted = new Set();
+    const run = async transport => {
+        attempted.add(transport);
+        try {
+            const translated = transport === 'same-origin'
+                ? await translateWithGoogleSameOrigin(text, target, source)
+                : await translateWithGoogleDirect(text, target, source);
+            updateGoogleTransportState(transport, true);
+            return translated;
+        } catch (error) {
+            updateGoogleTransportState(transport, false, error);
+            errors.push(error);
+            return null;
+        }
+    };
+
+    for (const transport of getGoogleTransportOrder(source)) {
+        const translated = await run(transport);
+        if (translated !== null) return translated;
+    }
+
+    await new Promise(resolve => window.setTimeout(resolve, googleRecoveryDelayMs));
+    const recoveryTransport = !googleSameOriginRouteUnavailable ? 'same-origin' : 'direct';
+    const lastError = errors[errors.length - 1];
+    const shouldRecover = errors.some(error => error?.googleNetworkError)
+        || Number(lastError?.googleStatus || 0) === 429
+        || Number(lastError?.googleStatus || 0) >= 500;
+    if (shouldRecover) {
+        const translated = await run(recoveryTransport);
+        if (translated !== null) return translated;
+    }
+
+    const details = Array.from(new Set(errors.map(error => error?.message || String(error)))).join('；');
+    const attemptedText = attempted.has('same-origin') && attempted.has('direct')
+        ? '酒馆同源通道和浏览器直连'
+        : attempted.has('same-origin') ? '酒馆同源通道' : '浏览器直连';
+    const failure = new Error(`Google 翻译连接失败，已自动尝试${attemptedText}：${details || '没有收到有效响应'}。请稍后再试。`);
+    failure.googleSkipSegmentFallback = shouldRecover;
+    throw failure;
+}
+
 async function translateWithGoogleWeb(text, targetLanguage) {
     const chunks = splitMachineRequestChunks(text);
     if (chunks.length > 1) {
@@ -5119,29 +5303,7 @@ async function translateWithGoogleWeb(text, targetLanguage) {
 
     const target = getMachineTargetCode(targetLanguage, translationChannels.google);
     const source = getMachineSourceCode(translationChannels.google);
-    const url = new URL('https://translate.googleapis.com/translate_a/single');
-    url.searchParams.set('client', 'gtx');
-    url.searchParams.set('sl', source);
-    url.searchParams.set('tl', target);
-    url.searchParams.set('dt', 't');
-    url.searchParams.set('q', text);
-
-    const response = await fetch(url.toString(), { method: 'GET', cache: 'no-cache' });
-    const raw = await response.text();
-    if (!response.ok) throw new Error(`Google 翻译 ${response.status}: ${compactHttpError(raw, response.statusText)}`);
-
-    let data;
-    try {
-        data = JSON.parse(raw);
-    } catch {
-        throw new Error('Google 翻译返回了无法解析的内容。');
-    }
-
-    const translated = Array.isArray(data?.[0])
-        ? data[0].map(part => part?.[0] || '').join('')
-        : '';
-    if (!translated.trim()) throw new Error('Google 翻译没有返回译文。');
-    return decodeHtmlEntities(translated.trim());
+    return requestGoogleTranslation(text, target, source);
 }
 
 function makeGoogleBatchMarker(index) {
@@ -5208,7 +5370,8 @@ async function translateGoogleSegmentBatch(batch, targetLanguage) {
         const translated = await translateWithGoogleWeb(joined, targetLanguage);
         const parts = splitGoogleBatchTranslation(translated, batch.length);
         if (parts?.length === batch.length) return parts;
-    } catch {
+    } catch (error) {
+        if (error?.googleSkipSegmentFallback) throw error;
         // Fall through to the old per-segment path. Speed should never cost correctness.
     }
 
@@ -5303,12 +5466,19 @@ async function requestMachineTranslationText(sourceText, options, onProgress) {
     if (channel === translationChannels.google) {
         const batches = makeGoogleSegmentBatches(resultSegments);
         let nextBatchIndex = 0;
+        let batchFailure = null;
         const worker = async () => {
-            while (nextBatchIndex < batches.length) {
+            while (!batchFailure && nextBatchIndex < batches.length) {
                 const batchIndex = nextBatchIndex;
                 nextBatchIndex += 1;
                 const batch = batches[batchIndex];
-                const translations = await translateGoogleSegmentBatch(batch, options.language);
+                let translations;
+                try {
+                    translations = await translateGoogleSegmentBatch(batch, options.language);
+                } catch (error) {
+                    batchFailure = batchFailure || error;
+                    throw error;
+                }
                 batch.forEach((segment, index) => {
                     segment.translation = translations[index] || '';
                 });
