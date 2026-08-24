@@ -56,10 +56,6 @@ const googleChunkLength = 1300;
 const googleBatchMaxSegments = 18;
 const googleBatchMaxChars = googleChunkLength;
 const googleBatchMarkerRegex = /\s*⟦\s*\d{6}\s*⟧\s*/gu;
-const googleRequestTimeoutMs = 12000;
-const googleSameOriginCooldownMs = 5 * 60 * 1000;
-const googleSameOriginFailureCooldownMs = 30 * 1000;
-const googleRecoveryDelayMs = 450;
 const aiBatchMaxSegments = 320;
 const aiBatchMaxChars = 20000;
 const aiRateLimitRetryDelays = [1800, 4200, 9000];
@@ -229,15 +225,13 @@ const mutedLiveDisplays = new Set();
 const originalRenderCache = new Map();
 const translatedIframeObservers = new WeakMap();
 const translatedIframeLoadHandlers = new WeakMap();
+const renderedTextNodeSourceKeys = new WeakMap();
 const fallbackIframeResizeObservers = new WeakMap();
 const fallbackPromotionObservers = new WeakMap();
 const renderedHtmlRetryStates = new Map();
 const renderedCodeRetryStates = new Map();
 const nativeMessageRenderSchedules = new Map();
 const renderedIframeRefreshSchedules = new Map();
-let googlePreferSameOriginUntil = 0;
-let googleBypassSameOriginUntil = 0;
-let googleSameOriginRouteUnavailable = false;
 
 function clone(value) {
     return JSON.parse(JSON.stringify(value));
@@ -2719,6 +2713,14 @@ function applyRenderedDomVersionDisplay(messageId, version, renderKey) {
         $text.attr('data-stft-render-key', renderKey);
         return true;
     }
+    // During streaming the existing rendered tree is the source of truth. An
+    // unchanged progress tick must not tear it down, otherwise regex/HTML
+    // renderers see a new subtree and visibly mount the decoration again.
+    if (isLiveRenderInProgress(messageId)) {
+        prependInlineToggleIfNeeded(messageId, $text, true, true);
+        $text.attr('data-stft-render-key', renderKey);
+        return true;
+    }
     const $nodes = buildRenderedDomVersionNodes(messageId, version);
     if (!$nodes?.length) return false;
     $text.empty();
@@ -3087,7 +3089,13 @@ function emitNativeMessageRendered(messageId) {
     }
 }
 
+function isLiveRenderInProgress(messageId) {
+    const recordKey = getMessageRecordKey(messageId);
+    return inFlight.has(recordKey) && liveTranslations.has(recordKey);
+}
+
 function scheduleNativeMessageRendered(messageId) {
+    if (isLiveRenderInProgress(messageId)) return;
     const chatKey = getChatKey();
     const recordKey = getMessageRecordKey(messageId);
     const scheduleKey = `${chatKey}::${recordKey}`;
@@ -3109,6 +3117,7 @@ function scheduleNativeMessageRendered(messageId) {
 
 function scheduleRenderedIframeTranslationRefresh(messageId) {
     if (messageId === undefined || messageId === null || messageId === '') return;
+    if (isLiveRenderInProgress(messageId)) return;
     const chatKey = getChatKey();
     const recordKey = getMessageRecordKey(messageId);
     const scheduleKey = `${chatKey}::${recordKey}`;
@@ -3117,6 +3126,7 @@ function scheduleRenderedIframeTranslationRefresh(messageId) {
     const timer = window.setTimeout(() => {
         renderedIframeRefreshSchedules.delete(scheduleKey);
         if (getChatKey() !== chatKey || getMessageRecordKey(messageId) !== recordKey) return;
+        if (isLiveRenderInProgress(messageId)) return;
 
         const record = loadStore().messages[recordKey];
         const version = getSelectedVersion(record);
@@ -3346,7 +3356,32 @@ function rerenderNativeMessageWithDisplayText(messageId, displayText) {
 
 function prependInlineToggleIfNeeded(messageId, $text, hasTranslation, visible) {
     if (!$text?.length || !hasTranslation) return;
-    $text.children(`.${INLINE_TOGGLE_CLASS}, .${LEGACY_TOGGLE_CLASS}, .${LEGACY_PANEL_CLASS}`).remove();
+    const selector = `.${INLINE_TOGGLE_CLASS}, .${LEGACY_TOGGLE_CLASS}, .${LEGACY_PANEL_CLASS}`;
+    const $toggles = $text.children(selector);
+    const $current = $toggles.filter(`.${INLINE_TOGGLE_CLASS}`).first();
+
+    if ($current.length) {
+        $toggles.not($current).remove();
+        const label = visible ? '取消译文' : '显示译文';
+        const title = visible ? '取消当前楼层译文显示' : '显示这个回复已保存的译文';
+        if ($current.hasClass('stft-inline-toggle-visible') !== visible) {
+            $current.toggleClass('stft-inline-toggle-visible', visible);
+        }
+        if ($current.attr('data-message-id') !== String(messageId)) {
+            $current.attr('data-message-id', String(messageId));
+        }
+        if ($current.attr('title') !== title) {
+            $current.attr('title', title);
+        }
+        const $label = $current.find('span').first();
+        if ($label.text() !== label) $label.text(label);
+        if ($text[0]?.firstElementChild !== $current[0]) {
+            $text.prepend($current.detach());
+        }
+        return;
+    }
+
+    $toggles.remove();
     $text.prepend($(renderInlineToggleButton(messageId, visible)));
 }
 
@@ -3424,6 +3459,22 @@ function shouldTranslateRenderedIframeTextNode(node) {
     return true;
 }
 
+function getStableRenderedTextSourceKey(node, currentText, availableSources = null) {
+    const currentKey = normalizeHtmlTextForMatch(currentText);
+    const storedKey = renderedTextNodeSourceKeys.get(node) || '';
+    if (currentKey && availableSources?.has(currentKey) && currentKey !== storedKey) {
+        renderedTextNodeSourceKeys.set(node, currentKey);
+        return currentKey;
+    }
+    if (storedKey && (!availableSources || availableSources.has(storedKey))) {
+        return storedKey;
+    }
+    if (currentKey && (!availableSources || availableSources.has(currentKey))) {
+        renderedTextNodeSourceKeys.set(node, currentKey);
+    }
+    return currentKey;
+}
+
 function buildHtmlSegmentQueues(htmlSegments) {
     const queues = new Map();
     for (const segment of htmlSegments || []) {
@@ -3455,6 +3506,18 @@ function buildHtmlRestoreQueues(htmlSegments) {
         if (!source || !translationKey) continue;
         if (!queues.has(translationKey)) queues.set(translationKey, []);
         queues.get(translationKey).push(source);
+    }
+    return queues;
+}
+
+function buildHtmlSourceQueues(htmlSegments) {
+    const queues = new Map();
+    for (const segment of htmlSegments || []) {
+        const source = String(segment.source ?? '').trim();
+        const sourceKey = normalizeHtmlTextForMatch(source);
+        if (!sourceKey || !source) continue;
+        if (!queues.has(sourceKey)) queues.set(sourceKey, []);
+        queues.get(sourceKey).push(source);
     }
     return queues;
 }
@@ -3504,11 +3567,13 @@ function applyHtmlSegmentsToDocument(doc, htmlSegments, options = {}) {
         const leading = raw.match(/^\s*/)?.[0] ?? '';
         const trailing = raw.match(/\s*$/)?.[0] ?? '';
         const core = raw.slice(leading.length, raw.length - trailing.length);
-        const key = normalizeHtmlTextForMatch(core);
+        const key = getStableRenderedTextSourceKey(node, core, queues);
         const queue = queues.get(key);
         const translation = queue?.shift() || lookup?.get(key);
         if (!translation) continue;
-        node.nodeValue = `${leading}${translation}${trailing}`;
+        const nextValue = `${leading}${translation}${trailing}`;
+        if (node.nodeValue === nextValue) continue;
+        node.nodeValue = nextValue;
         changed = true;
     }
 
@@ -3725,7 +3790,8 @@ function applyHtmlSegmentsToRenderedIframe(iframe, htmlSegments, renderKey) {
 
 function restoreHtmlSegmentsInRenderedIframe(iframe, htmlSegments) {
     const queues = buildHtmlRestoreQueues(htmlSegments);
-    if (!queues.size) return false;
+    const sourceQueues = buildHtmlSourceQueues(htmlSegments);
+    if (!queues.size && !sourceQueues.size) return false;
 
     let doc;
     try {
@@ -3753,11 +3819,15 @@ function restoreHtmlSegmentsInRenderedIframe(iframe, htmlSegments) {
         const trailing = raw.match(/\s*$/)?.[0] ?? '';
         const core = raw.slice(leading.length, raw.length - trailing.length);
         const key = normalizeHtmlTextForMatch(core);
-        const queue = queues.get(key);
-        const source = queue?.shift();
+        const stableSourceKey = renderedTextNodeSourceKeys.get(node) || '';
+        const source = sourceQueues.get(stableSourceKey)?.shift() || queues.get(key)?.shift();
         if (!source) continue;
-        node.nodeValue = `${leading}${source}${trailing}`;
-        changed = true;
+        const nextValue = `${leading}${source}${trailing}`;
+        if (node.nodeValue !== nextValue) {
+            node.nodeValue = nextValue;
+            changed = true;
+        }
+        renderedTextNodeSourceKeys.delete(node);
     }
 
     delete iframe.dataset.stftTranslationKey;
@@ -3773,6 +3843,7 @@ function hasRenderedIframeTranslation($text, renderKey) {
 }
 
 function scheduleRenderedHtmlRetry(messageId, renderKey) {
+    if (isLiveRenderInProgress(messageId)) return;
     const retryKey = `${getMessageRecordKey(messageId)}::${renderKey}`;
     if (renderedHtmlRetryStates.has(retryKey)) return;
 
@@ -3885,11 +3956,13 @@ function applyRenderedTextSegmentsToCurrentDom($text, renderedSegments = []) {
         const leading = raw.match(/^\s*/)?.[0] ?? '';
         const trailing = raw.match(/\s*$/)?.[0] ?? '';
         const core = raw.slice(leading.length, raw.length - trailing.length);
-        const key = normalizeHtmlTextForMatch(core);
+        const key = getStableRenderedTextSourceKey(node, core, queues);
         const queue = queues.get(key);
         const translation = queue?.shift();
         if (!translation) continue;
-        node.nodeValue = `${leading}${translation}${trailing}`;
+        const nextValue = `${leading}${translation}${trailing}`;
+        if (node.nodeValue === nextValue) continue;
+        node.nodeValue = nextValue;
         changed = true;
     }
     return changed;
@@ -3960,6 +4033,7 @@ function hasRenderedCodeTranslation($text, codeSegments = [], renderKey = '') {
 }
 
 function scheduleRenderedCodeRetry(messageId, renderKey) {
+    if (isLiveRenderInProgress(messageId)) return;
     const retryKey = `${getMessageRecordKey(messageId)}::${renderKey}`;
     if (renderedCodeRetryStates.has(retryKey)) return;
 
@@ -4121,9 +4195,16 @@ function applyDisplay(messageId) {
         }
     }
 
-    if (renderedMixedVersion && applyRenderedMixedVersionDisplay(messageId, version, renderKey)) {
-        updateButtonState(getMessageElement(messageId));
-        return;
+    if (renderedMixedVersion) {
+        if (applyRenderedMixedVersionDisplay(messageId, version, renderKey)) {
+            updateButtonState(getMessageElement(messageId));
+            return;
+        }
+        if (isLiveRenderInProgress(messageId)) {
+            $text.attr('data-stft-render-key', renderKey);
+            updateButtonState(getMessageElement(messageId));
+            return;
+        }
     }
 
     if (htmlVersion && !mixedHtmlVersion) {
@@ -4143,9 +4224,16 @@ function applyDisplay(messageId) {
         }
     }
 
-    if (isRenderedDomVersion(version) && applyRenderedDomVersionDisplay(messageId, version, renderKey)) {
-        updateButtonState(getMessageElement(messageId));
-        return;
+    if (isRenderedDomVersion(version)) {
+        if (applyRenderedDomVersionDisplay(messageId, version, renderKey)) {
+            updateButtonState(getMessageElement(messageId));
+            return;
+        }
+        if (isLiveRenderInProgress(messageId)) {
+            $text.attr('data-stft-render-key', renderKey);
+            updateButtonState(getMessageElement(messageId));
+            return;
+        }
     }
 
     rememberOriginalRender(messageId, $text);
@@ -4402,16 +4490,24 @@ function applyTranslationResultToVersion(version, result) {
 function makeProgressRenderer(messageId, recordKey, version, localOptions, channelName, total = 0) {
     let lastRenderAt = 0;
     let pending = null;
-    let frame = 0;
-    const renderInterval = 90;
+    let renderTimer = 0;
+    const hasComplexRender = isRenderedMixedVersion(version)
+        || isRenderedDomVersion(version)
+        || isHtmlDocumentVersion(version);
+    const renderInterval = hasComplexRender ? 220 : 90;
     const statusInterval = 650;
     let lastStatusAt = 0;
 
     const flush = () => {
-        frame = 0;
+        renderTimer = 0;
         if (!pending) return;
+        if (!inFlight.has(recordKey) || !liveTranslations.has(recordKey)) {
+            pending = null;
+            return;
+        }
         const progress = pending;
         pending = null;
+        lastRenderAt = performance.now();
         applyTranslationResultToVersion(version, progress);
         version.updatedAt = new Date().toISOString();
         setLiveTranslation(recordKey, version);
@@ -4442,19 +4538,26 @@ function makeProgressRenderer(messageId, recordKey, version, localOptions, chann
         }
     };
 
-    return progress => {
+    const renderProgress = progress => {
         pending = progress;
         const now = performance.now();
-        if (now - lastRenderAt >= renderInterval) {
-            lastRenderAt = now;
+        const remaining = renderInterval - (now - lastRenderAt);
+        if (remaining <= 0) {
+            if (renderTimer) {
+                window.clearTimeout(renderTimer);
+                renderTimer = 0;
+            }
             flush();
-        } else if (!frame) {
-            frame = requestAnimationFrame(() => {
-                lastRenderAt = performance.now();
-                flush();
-            });
+        } else if (!renderTimer) {
+            renderTimer = window.setTimeout(flush, remaining);
         }
     };
+    renderProgress.cancel = () => {
+        if (renderTimer) window.clearTimeout(renderTimer);
+        renderTimer = 0;
+        pending = null;
+    };
+    return renderProgress;
 }
 
 function resolveTargetLanguage(localValue = null, customValue = null) {
@@ -5114,183 +5217,6 @@ function splitMachineRequestChunks(text, maxLength = googleChunkLength) {
     return chunks.filter(Boolean);
 }
 
-function makeGoogleTransportError(transport, message, options = {}) {
-    const error = new Error(message);
-    error.googleTransport = transport;
-    error.googleStatus = Number(options.status || 0);
-    error.googleNetworkError = Boolean(options.network);
-    return error;
-}
-
-async function fetchGoogleWithTimeout(url, init, transport) {
-    const controller = typeof AbortController === 'function' ? new AbortController() : null;
-    const timer = controller
-        ? window.setTimeout(() => controller.abort(), googleRequestTimeoutMs)
-        : 0;
-    try {
-        return await fetch(url, {
-            ...init,
-            ...(controller ? { signal: controller.signal } : {}),
-        });
-    } catch (error) {
-        const timedOut = Boolean(controller?.signal?.aborted);
-        const detail = timedOut
-            ? `请求超过 ${Math.round(googleRequestTimeoutMs / 1000)} 秒`
-            : (error?.message || String(error));
-        const label = transport === 'same-origin' ? '酒馆同源通道' : '浏览器直连';
-        throw makeGoogleTransportError(transport, `${label}：${detail}`, { network: true });
-    } finally {
-        if (timer) window.clearTimeout(timer);
-    }
-}
-
-async function readGoogleResponseText(response, transport) {
-    try {
-        return await response.text();
-    } catch (error) {
-        const label = transport === 'same-origin' ? '酒馆同源通道' : '浏览器直连';
-        throw makeGoogleTransportError(
-            transport,
-            `${label}读取响应时中断：${error?.message || String(error)}`,
-            { network: true },
-        );
-    }
-}
-
-async function translateWithGoogleSameOrigin(text, target, source) {
-    const response = await fetchGoogleWithTimeout('/api/translate/google', {
-        method: 'POST',
-        headers: getRequestHeaders(),
-        cache: 'no-store',
-        body: JSON.stringify({ text, lang: target, source }),
-    }, 'same-origin');
-    const raw = await readGoogleResponseText(response, 'same-origin');
-    if (!response.ok) {
-        throw makeGoogleTransportError(
-            'same-origin',
-            `酒馆同源通道 ${response.status}：${compactHttpError(raw, response.statusText)}`,
-            { status: response.status },
-        );
-    }
-    const translated = decodeHtmlEntities(raw.trim());
-    if (!translated) {
-        throw makeGoogleTransportError('same-origin', '酒馆同源通道没有返回译文。');
-    }
-    return translated;
-}
-
-async function translateWithGoogleDirect(text, target, source) {
-    const url = new URL('https://translate.googleapis.com/translate_a/single');
-    url.searchParams.set('client', 'gtx');
-    url.searchParams.set('sl', source);
-    url.searchParams.set('tl', target);
-    url.searchParams.set('dt', 't');
-    url.searchParams.set('q', text);
-
-    const response = await fetchGoogleWithTimeout(url.toString(), {
-        method: 'GET',
-        mode: 'cors',
-        credentials: 'omit',
-        cache: 'no-store',
-    }, 'direct');
-    const raw = await readGoogleResponseText(response, 'direct');
-    if (!response.ok) {
-        throw makeGoogleTransportError(
-            'direct',
-            `浏览器直连 ${response.status}：${compactHttpError(raw, response.statusText)}`,
-            { status: response.status },
-        );
-    }
-
-    let data;
-    try {
-        data = JSON.parse(raw);
-    } catch {
-        throw makeGoogleTransportError('direct', '浏览器直连返回了无法解析的内容。');
-    }
-
-    const translated = Array.isArray(data?.[0])
-        ? data[0].map(part => part?.[0] || '').join('')
-        : '';
-    if (!translated.trim()) {
-        throw makeGoogleTransportError('direct', '浏览器直连没有返回译文。');
-    }
-    return decodeHtmlEntities(translated.trim());
-}
-
-function updateGoogleTransportState(transport, succeeded, error = null) {
-    const now = Date.now();
-    if (transport === 'same-origin') {
-        if (succeeded) {
-            googleBypassSameOriginUntil = 0;
-            googlePreferSameOriginUntil = now + googleSameOriginCooldownMs;
-            return;
-        }
-        if ([404, 405, 501].includes(Number(error?.googleStatus || 0))) {
-            googleSameOriginRouteUnavailable = true;
-            return;
-        }
-        googleBypassSameOriginUntil = now + googleSameOriginFailureCooldownMs;
-        return;
-    }
-
-    if (!succeeded) {
-        googlePreferSameOriginUntil = now + googleSameOriginCooldownMs;
-    }
-}
-
-function getGoogleTransportOrder(source) {
-    const now = Date.now();
-    const sameOriginAllowed = !googleSameOriginRouteUnavailable && now >= googleBypassSameOriginUntil;
-    const preferSameOrigin = sameOriginAllowed
-        && (source === 'auto' || now < googlePreferSameOriginUntil);
-    if (preferSameOrigin) return ['same-origin', 'direct'];
-    return sameOriginAllowed ? ['direct', 'same-origin'] : ['direct'];
-}
-
-async function requestGoogleTranslation(text, target, source) {
-    const errors = [];
-    const attempted = new Set();
-    const run = async transport => {
-        attempted.add(transport);
-        try {
-            const translated = transport === 'same-origin'
-                ? await translateWithGoogleSameOrigin(text, target, source)
-                : await translateWithGoogleDirect(text, target, source);
-            updateGoogleTransportState(transport, true);
-            return translated;
-        } catch (error) {
-            updateGoogleTransportState(transport, false, error);
-            errors.push(error);
-            return null;
-        }
-    };
-
-    for (const transport of getGoogleTransportOrder(source)) {
-        const translated = await run(transport);
-        if (translated !== null) return translated;
-    }
-
-    await new Promise(resolve => window.setTimeout(resolve, googleRecoveryDelayMs));
-    const recoveryTransport = !googleSameOriginRouteUnavailable ? 'same-origin' : 'direct';
-    const lastError = errors[errors.length - 1];
-    const shouldRecover = errors.some(error => error?.googleNetworkError)
-        || Number(lastError?.googleStatus || 0) === 429
-        || Number(lastError?.googleStatus || 0) >= 500;
-    if (shouldRecover) {
-        const translated = await run(recoveryTransport);
-        if (translated !== null) return translated;
-    }
-
-    const details = Array.from(new Set(errors.map(error => error?.message || String(error)))).join('；');
-    const attemptedText = attempted.has('same-origin') && attempted.has('direct')
-        ? '酒馆同源通道和浏览器直连'
-        : attempted.has('same-origin') ? '酒馆同源通道' : '浏览器直连';
-    const failure = new Error(`Google 翻译连接失败，已自动尝试${attemptedText}：${details || '没有收到有效响应'}。请稍后再试。`);
-    failure.googleSkipSegmentFallback = shouldRecover;
-    throw failure;
-}
-
 async function translateWithGoogleWeb(text, targetLanguage) {
     const chunks = splitMachineRequestChunks(text);
     if (chunks.length > 1) {
@@ -5303,7 +5229,29 @@ async function translateWithGoogleWeb(text, targetLanguage) {
 
     const target = getMachineTargetCode(targetLanguage, translationChannels.google);
     const source = getMachineSourceCode(translationChannels.google);
-    return requestGoogleTranslation(text, target, source);
+    const url = new URL('https://translate.googleapis.com/translate_a/single');
+    url.searchParams.set('client', 'gtx');
+    url.searchParams.set('sl', source);
+    url.searchParams.set('tl', target);
+    url.searchParams.set('dt', 't');
+    url.searchParams.set('q', text);
+
+    const response = await fetch(url.toString(), { method: 'GET', cache: 'no-cache' });
+    const raw = await response.text();
+    if (!response.ok) throw new Error(`Google 翻译 ${response.status}: ${compactHttpError(raw, response.statusText)}`);
+
+    let data;
+    try {
+        data = JSON.parse(raw);
+    } catch {
+        throw new Error('Google 翻译返回了无法解析的内容。');
+    }
+
+    const translated = Array.isArray(data?.[0])
+        ? data[0].map(part => part?.[0] || '').join('')
+        : '';
+    if (!translated.trim()) throw new Error('Google 翻译没有返回译文。');
+    return decodeHtmlEntities(translated.trim());
 }
 
 function makeGoogleBatchMarker(index) {
@@ -5370,8 +5318,7 @@ async function translateGoogleSegmentBatch(batch, targetLanguage) {
         const translated = await translateWithGoogleWeb(joined, targetLanguage);
         const parts = splitGoogleBatchTranslation(translated, batch.length);
         if (parts?.length === batch.length) return parts;
-    } catch (error) {
-        if (error?.googleSkipSegmentFallback) throw error;
+    } catch {
         // Fall through to the old per-segment path. Speed should never cost correctness.
     }
 
@@ -5466,19 +5413,12 @@ async function requestMachineTranslationText(sourceText, options, onProgress) {
     if (channel === translationChannels.google) {
         const batches = makeGoogleSegmentBatches(resultSegments);
         let nextBatchIndex = 0;
-        let batchFailure = null;
         const worker = async () => {
-            while (!batchFailure && nextBatchIndex < batches.length) {
+            while (nextBatchIndex < batches.length) {
                 const batchIndex = nextBatchIndex;
                 nextBatchIndex += 1;
                 const batch = batches[batchIndex];
-                let translations;
-                try {
-                    translations = await translateGoogleSegmentBatch(batch, options.language);
-                } catch (error) {
-                    batchFailure = batchFailure || error;
-                    throw error;
-                }
+                const translations = await translateGoogleSegmentBatch(batch, options.language);
                 batch.forEach((segment, index) => {
                     segment.translation = translations[index] || '';
                 });
@@ -5838,6 +5778,7 @@ async function translateMessage(messageId, options = {}) {
             }
 
             const result = await requestMachineTranslationText(sourceText, localOptions, progressRenderer);
+            progressRenderer?.cancel?.();
 
             if (result.looksUntranslated) {
                 clearLiveTranslation(recordKey);
@@ -5906,6 +5847,7 @@ async function translateMessage(messageId, options = {}) {
         }
 
         const result = await requestTranslation(messageId, localOptions, sourceText, progressRenderer);
+        progressRenderer?.cancel?.();
         applyTranslationResultToVersion(version, result);
 
         updateMessageRecord(messageId, record => {
