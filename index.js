@@ -52,13 +52,21 @@ const BUILTIN_TRANSLATE_SWIPE_GUARD_KEY = '__floorTranslatorSwipeGuardInstalled'
 const NATIVE_RENDER_SOURCE = 'floor_translator';
 const builtinTranslateIncomingModes = new Set(['responses', 'both']);
 const machineConcurrency = 4;
-const googleChunkLength = 1300;
+const googleRequestConcurrency = 3;
+const googleChunkLength = 2200;
 const googleBatchMaxSegments = 18;
 const googleBatchMaxChars = googleChunkLength;
 const googleBatchMarkerRegex = /\s*⟦\s*\d{6}\s*⟧\s*/gu;
+const googleRequestSpacingMs = 80;
+const googleRecoverySpacingMs = 650;
+const googleRateLimitRetryDelays = [2500, 9000, 30000];
 const aiBatchMaxSegments = 320;
 const aiBatchMaxChars = 20000;
 const aiRateLimitRetryDelays = [1800, 4200, 9000];
+
+let googleNextRequestAt = 0;
+let googleRateLimitUntil = 0;
+let googleRateLimitLevel = 0;
 
 const languages = [
     ['auto', '自动识别'],
@@ -5236,9 +5244,13 @@ async function translateWithGoogleWeb(text, targetLanguage) {
     url.searchParams.set('dt', 't');
     url.searchParams.set('q', text);
 
-    const response = await fetch(url.toString(), { method: 'GET', cache: 'no-cache' });
+    const response = await fetchGoogleTranslationResponse(url.toString());
     const raw = await response.text();
-    if (!response.ok) throw new Error(`Google 翻译 ${response.status}: ${compactHttpError(raw, response.statusText)}`);
+    if (!response.ok) {
+        const error = new Error(`Google 翻译 ${response.status}: ${compactHttpError(raw, response.statusText)}`);
+        error.googleTranslateStatus = response.status;
+        throw error;
+    }
 
     let data;
     try {
@@ -5252,6 +5264,96 @@ async function translateWithGoogleWeb(text, targetLanguage) {
         : '';
     if (!translated.trim()) throw new Error('Google 翻译没有返回译文。');
     return decodeHtmlEntities(translated.trim());
+}
+
+function waitForGoogleRequest(ms) {
+    return new Promise(resolve => window.setTimeout(resolve, Math.max(0, ms)));
+}
+
+function getGoogleRetryAfterMs(response) {
+    const value = response?.headers?.get?.('retry-after');
+    if (!value) return 0;
+
+    const seconds = Number(value);
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+
+    const date = Date.parse(value);
+    return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
+}
+
+async function reserveGoogleRequestTime() {
+    const now = Date.now();
+    const startAt = Math.max(now, googleNextRequestAt, googleRateLimitUntil);
+    const spacing = googleRateLimitLevel > 0 ? googleRecoverySpacingMs : googleRequestSpacingMs;
+    googleNextRequestAt = startAt + spacing;
+    if (startAt > now) await waitForGoogleRequest(startAt - now);
+}
+
+function beginGoogleRateLimitCooldown(response) {
+    const now = Date.now();
+    const alreadyCoolingDown = googleRateLimitUntil > now + 100;
+    if (!alreadyCoolingDown) {
+        googleRateLimitLevel = Math.min(googleRateLimitLevel + 1, googleRateLimitRetryDelays.length);
+    }
+
+    const fallbackDelay = googleRateLimitRetryDelays[Math.max(0, googleRateLimitLevel - 1)];
+    const retryAfter = Math.min(getGoogleRetryAfterMs(response), 60000);
+    const jitter = Math.floor(Math.random() * 350);
+    googleRateLimitUntil = Math.max(googleRateLimitUntil, now + Math.max(fallbackDelay, retryAfter) + jitter);
+    googleNextRequestAt = Math.max(googleNextRequestAt, googleRateLimitUntil);
+}
+
+function markGoogleRequestSucceeded() {
+    googleRateLimitUntil = 0;
+    googleRateLimitLevel = 0;
+}
+
+function makeGoogleTransportError(error) {
+    const wrapped = new Error(`Google 翻译网络请求失败: ${error?.message || String(error || '未知错误')}`);
+    wrapped.googleTranslateTransportError = true;
+    wrapped.cause = error;
+    return wrapped;
+}
+
+async function fetchGoogleTranslationOnce(url) {
+    await reserveGoogleRequestTime();
+    try {
+        return await fetch(url, { method: 'GET', cache: 'no-cache' });
+    } catch (error) {
+        if (error?.name === 'AbortError') throw error;
+        throw makeGoogleTransportError(error);
+    }
+}
+
+async function fetchGoogleTranslationResponse(url) {
+    let lastResponse = null;
+    let lastError = null;
+    for (let attempt = 0; attempt <= googleRateLimitRetryDelays.length; attempt += 1) {
+        let response;
+        try {
+            response = await fetchGoogleTranslationOnce(url);
+        } catch (error) {
+            if (!error?.googleTranslateTransportError || attempt >= googleRateLimitRetryDelays.length) throw error;
+            lastError = error;
+            beginGoogleRateLimitCooldown(null);
+            continue;
+        }
+
+        if (response.status !== 429) {
+            if (response.ok) markGoogleRequestSucceeded();
+            return response;
+        }
+
+        lastResponse = response;
+        if (attempt >= googleRateLimitRetryDelays.length) break;
+        beginGoogleRateLimitCooldown(response);
+    }
+    if (!lastResponse && lastError) throw lastError;
+    return lastResponse;
+}
+
+function isGoogleRateLimitError(error) {
+    return Number(error?.googleTranslateStatus) === 429;
 }
 
 function makeGoogleBatchMarker(index) {
@@ -5318,7 +5420,8 @@ async function translateGoogleSegmentBatch(batch, targetLanguage) {
         const translated = await translateWithGoogleWeb(joined, targetLanguage);
         const parts = splitGoogleBatchTranslation(translated, batch.length);
         if (parts?.length === batch.length) return parts;
-    } catch {
+    } catch (error) {
+        if (isGoogleRateLimitError(error) || error?.googleTranslateTransportError) throw error;
         // Fall through to the old per-segment path. Speed should never cost correctness.
     }
 
@@ -5426,7 +5529,7 @@ async function requestMachineTranslationText(sourceText, options, onProgress) {
                 emitProgress();
             }
         };
-        const workers = Array.from({ length: Math.min(machineConcurrency, Math.max(batches.length, 1)) }, () => worker());
+        const workers = Array.from({ length: Math.min(googleRequestConcurrency, Math.max(batches.length, 1)) }, () => worker());
         await Promise.all(workers);
     } else {
         const worker = async () => {
